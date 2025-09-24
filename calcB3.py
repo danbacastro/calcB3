@@ -110,7 +110,6 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
         value = parse_brl_number(m.group("value"))
         dc = m.group("dc")
 
-        # Map paper/company name to ticker if available
         ticker = name_to_ticker_map.get(paper_name, paper_name)
 
         records.append(
@@ -175,18 +174,14 @@ def parse_header_dates_and_net(text: str):
     lines = text.splitlines()
     pairs = list(zip(lines, [strip_accents(l).lower() for l in lines]))
 
-    # Look for various labels near top for trading date
-    # Examples: "Data do pregão", "Data pregão", "Data da negociação", "Data negociação", "Negociação: dd/mm/aaaa"
     date_labels = ("data do preg", "data preg", "data da negoc", "data negoc", "negociacao", "negociação", "pregao")
     data_pregao = None
-    # Prefer first match in top 120 lines
     for raw, norm in pairs[:120]:
         if any(lbl in norm for lbl in date_labels):
             m = re.search(r"(\d{2}/\d{2}/\d{4})", raw)
             if m:
                 data_pregao = m.group(1)
                 break
-    # Fallback: first date near the top, excluding CNPJ-like patterns (##.###.###/####-##)
     if not data_pregao:
         for raw, norm in pairs[:120]:
             if re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", raw):
@@ -198,7 +193,7 @@ def parse_header_dates_and_net(text: str):
 
     liquido_para_data = None
     liquido_para_valor = None
-    for raw, norm in pairs[::-1]:  # bottom-up
+    for raw, norm in pairs[::-1]:
         if ("liquido para" in norm) or ("l\u00edquido para" in norm):
             md = re.search(r"(?:L[ií]quido para)\s+(\d{2}/\d{2}/\d{4})", raw)
             if md:
@@ -208,58 +203,6 @@ def parse_header_dates_and_net(text: str):
                 liquido_para_valor = vals[-1]
             break
 
-    # If equal to liquidação date, try a different earlier date
-    if data_pregao and liquido_para_data and data_pregao == liquido_para_data:
-        for raw, norm in pairs[:160]:
-            m = re.findall(r"(\d{2}/\d{2}/\d{4})", raw)
-            for d in m:
-                if d != liquido_para_data:
-                    data_pregao = d
-                    break
-            if data_pregao != liquido_para_data:
-                break
-
-    return data_pregao, liquido_para_data, liquido_para_valor
-
-(text: str):
-    """Extract 'Data do pregão' and 'Líquido para <data> <valor>' robustly (B3/XP)."""
-    lines = text.splitlines()
-    pairs = list(zip(lines, [strip_accents(l).lower() for l in lines]))
-
-    # Look for various labels near top for trading date
-    # Examples: "Data do pregão", "Data pregão", "Data da negociação", "Data negociação", "Negociação: dd/mm/aaaa"
-    date_labels = ("data do preg", "data preg", "data da negoc", "data negoc", "negociacao", "negociação", "pregao")
-    data_pregao = None
-    # Prefer first match in top 120 lines
-    for raw, norm in pairs[:120]:
-        if any(lbl in norm for lbl in date_labels):
-            m = re.search(r"(\d{2}/\d{2}/\d{4})", raw)
-            if m:
-                data_pregao = m.group(1)
-                break
-    # Fallback: first date near the top, excluding CNPJ-like patterns (##.###.###/####-##)
-    if not data_pregao:
-        for raw, norm in pairs[:120]:
-            if re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", raw):
-                continue
-            m = re.search(r"(\d{2}/\d{2}/\d{4})", raw)
-            if m:
-                data_pregao = m.group(1)
-                break
-
-    liquido_para_data = None
-    liquido_para_valor = None
-    for raw, norm in pairs[::-1]:  # bottom-up
-        if ("liquido para" in norm) or ("l\u00edquido para" in norm):
-            md = re.search(r"(?:L[ií]quido para)\s+(\d{2}/\d{2}/\d{4})", raw)
-            if md:
-                liquido_para_data = md.group(1)
-            vals = re.findall(r"(\d{1,3}(?:\.\d{3})*,\d{2})", raw)
-            if vals:
-                liquido_para_valor = vals[-1]
-            break
-
-    # If equal to liquidação date, try a different earlier date
     if data_pregao and liquido_para_data and data_pregao == liquido_para_data:
         for raw, norm in pairs[:160]:
             m = re.findall(r"(\d{2}/\d{2}/\d{4})", raw)
@@ -279,20 +222,17 @@ def parse_cost_components(text: str) -> dict:
     Returns a dict with atomic components (no aggregates), plus metadata keys:
       - _aggregates_found: list of aggregate labels found (not counted unless needed)
       - _used_aggregate_substitute: True if we had to use an aggregate (e.g., 'Taxas B3') due to missing atomics.
+      - _irrf_detected: numeric IRRF for info (never included in rateio)
     """
-    t = strip_accents(text).lower()
-
-    # Patterns for atomics
     pats = {
-        "liquidacao": r"taxa\s*de\s*liquida[cç][aã]o\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "emolumentos": r"emolumentos\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "registro": r"(?:taxa\s*de\s*registro|taxa\s*de\s*transf\.\s*de\s*ativos)\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "corretagem": r"corretag\w*\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "taxa_operacional": r"(?:taxa|tarifa)\s*operacion\w+\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "iss": r"\biss\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        # 'impostos' here is generic (ISS muitas vezes já vem separado); ainda assim alguns PDFs usam "Impostos" para ISS.
-        "impostos": r"\bimpostos\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "outros": r"\boutros\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "liquidacao": r"Taxa\s*de\s*liquida[cç][aã]o\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "emolumentos": r"Emolumentos\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "registro": r"(?:Taxa\s*de\s*Registro|Taxa\s*de\s*Transf\.\s*de\s*Ativos)\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "corretagem": r"Corretag\w*\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "taxa_operacional": r"(?:Taxa|Tarifa)\s*Operacion\w+\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "iss": r"\bISS\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "impostos": r"\bImpostos\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "outros": r"\bOutros\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
     }
     components = {}
     for key, pat in pats.items():
@@ -300,40 +240,33 @@ def parse_cost_components(text: str) -> dict:
         if m:
             components[key] = parse_brl_number(m.group(1))
 
-    # Aggregates (não somar junto com atomics para evitar dupla contagem)
     aggregates = {}
     agg_pats = {
-        "total_bovespa_soma": r"total\s*bovespa\s*/\s*soma\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "taxas_b3": r"taxas?\s*b3\s*[:\-]?\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "total_custos_despesas": r"total\s*custos\s*/\s*despesas\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "custos_despesas": r"\bcustos\s*/\s*despesas\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "total_bovespa_soma": r"Total\s*Bovespa\s*/\s*Soma\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "taxas_b3": r"Taxas?\s*B3\s*[:\-]?\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "total_custos_despesas": r"Total\s*Custos\s*/\s*Despesas\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "custos_despesas": r"\bCustos\s*/\s*Despesas\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
     }
     for key, pat in agg_pats.items():
         m = re.search(pat, text, flags=re.IGNORECASE)
         if m:
             aggregates[key] = parse_brl_number(m.group(1))
 
-    # IRRF (nunca incluir no rateio)
     irrf = None
-    m_irrf = re.search(r"i\.?r\.?r\.?f\.?.*?(\d{1,3}(?:\.\d{3})*,\d{2})", text, flags=re.IGNORECASE)
+    m_irrf = re.search(r"I\.?R\.?R\.?F\.?.*?(\d{1,3}(?:\.\d{3})*,\d{2})", text, flags=re.IGNORECASE)
     if m_irrf:
         irrf = parse_brl_number(m_irrf.group(1))
 
-    # Decide o total de custos "atômicos" (preferencial)
     atomic_total = sum(components.values()) if components else 0.0
     used_aggregate = False
 
-    # Se não achou atomics, usar substitutos agregados na ordem (taxas_b3, total_bovespa_soma, custos/despesas)
     if atomic_total == 0.0:
-        # Primeiro: 'taxas_b3' costuma ser a soma de liquidação+emolumentos+registro
         if "taxas_b3" in aggregates:
             components["taxas_b3_subst"] = aggregates["taxas_b3"]
             used_aggregate = True
-        # Senão: 'total_bovespa_soma' (mas em geral é subtotal de B3)
         elif "total_bovespa_soma" in aggregates:
             components["total_bovespa_soma_subst"] = aggregates["total_bovespa_soma"]
             used_aggregate = True
-        # Por fim: 'custos/despesas' total (pode incluir corretagem/ISS etc. — válido como fallback)
         elif "total_custos_despesas" in aggregates:
             components["custos_despesas_subst"] = aggregates["total_custos_despesas"]
             used_aggregate = True
@@ -342,6 +275,7 @@ def parse_cost_components(text: str) -> dict:
     components["_used_aggregate_substitute"] = used_aggregate
     components["_irrf_detected"] = irrf
     return components
+
 
 def allocate_costs_proportional(amounts: pd.Series, total_costs: float) -> pd.Series:
     """Allocate total_costs across 'amounts' proportionally (by value), with rounding fix to match exactly."""
@@ -379,7 +313,6 @@ def _format_dt_local(dt) -> str:
             if dt.tzinfo is None:
                 dt = dt.tz_localize(UTC)
             return dt.astimezone(TZ).strftime("%d/%m/%Y %H:%M")
-        # datetime
         if getattr(dt, "tzinfo", None) is None:
             dt = dt.replace(tzinfo=UTC)
         return dt.astimezone(TZ).strftime("%d/%m/%Y %H:%M")
@@ -392,11 +325,7 @@ def _format_dt_local(dt) -> str:
 
 @st.cache_data(show_spinner=False, ttl=60)
 def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) -> pd.DataFrame:
-    """
-    Use intraday 1-minute data to get a timestamped 'Último' (no more 00:00).
-    Also fetch the close around ref_date for 'Fechamento (pregão)'.
-    Cache for 60s. Use the refresh button to clear this cache.
-    """
+    """Intraday + fechamento do pregão."""
     cols = ["Ticker", "Símbolo", "Último", "Último (quando)", "Fechamento (pregão)", "Pregão (data)"]
     out_rows = []
 
@@ -404,7 +333,6 @@ def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) ->
         return pd.DataFrame(columns=cols)
 
     now_tz = datetime.now(TZ)
-    # Window for daily close lookup
     if ref_date is None:
         start_daily = (now_tz - timedelta(days=10)).strftime("%Y-%m-%d")
         end_daily = (now_tz + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -420,14 +348,12 @@ def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) ->
         close_dt = None
 
         try:
-            # Intraday 1m (last 2 days) for "Último"
             h1m = yf.Ticker(sym).history(period="2d", interval="1m", auto_adjust=False)
             if not h1m.empty and "Close" in h1m:
                 series = h1m["Close"].dropna()
                 if not series.empty:
                     last_px = float(series.iloc[-1])
                     idx = series.index[-1]
-                    # yfinance returns tz-aware UTC index for intraday; ensure UTC then convert
                     if getattr(idx, "tzinfo", None) is None:
                         idx = pd.Timestamp(idx).tz_localize(UTC)
                     last_dt = idx.tz_convert(TZ)
@@ -435,23 +361,18 @@ def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) ->
             pass
 
         try:
-            # Daily close around ref_date for "Fechamento (pregão)"
             hd = yf.Ticker(sym).history(start=start_daily, end=end_daily, auto_adjust=False)
             if not hd.empty and "Close" in hd:
                 s = hd["Close"].dropna()
                 if not s.empty:
                     if ref_date is None:
-                        close_px = float(s.iloc[-1])
-                        idx = s.index[-1]
+                        close_px = float(s.iloc[-1]); idx = s.index[-1]
                     else:
                         idxs = s.index[s.index.date <= ref_date.date()]
                         if len(idxs) > 0:
-                            close_px = float(s.loc[idxs[-1]])
-                            idx = idxs[-1]
+                            close_px = float(s.loc[idxs[-1]]); idx = idxs[-1]
                         else:
-                            idx = s.index[-1]
-                            close_px = float(s.iloc[-1])
-                    # Daily bars usually have date-only; localize to UTC midnight then convert
+                            idx = s.index[-1]; close_px = float(s.iloc[-1])
                     if getattr(idx, "tzinfo", None) is None:
                         idx = pd.Timestamp(idx).tz_localize(UTC)
                     close_dt = idx.tz_convert(TZ)
@@ -493,12 +414,6 @@ st.markdown(
 st.markdown('<div class="big-title">Calc B3 – Nota de Corretagem</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Extraia, agregue e rateie custos por ativo (proporcional ao valor financeiro), com preço médio e cotações.</div>', unsafe_allow_html=True)
 
-# Provider badge
-_badge_cls = "badge-xp" if provider == "xp" else "badge-b3"
-_badge_label = provider.upper()
-st.markdown(f'<div class="muted">Provedor detectado: <span class="badge {_badge_cls}">{_badge_label}</span></div>', unsafe_allow_html=True)
-
-
 with st.sidebar:
     st.header("Opções")
     incluir_bovespa_soma = st.checkbox("Incluir 'Total Bovespa / Soma' nos custos para rateio", value=False)
@@ -509,11 +424,7 @@ with st.sidebar:
     map_file = st.file_uploader("Upload CSV de mapeamento (opcional)", type=["csv"], key="map_csv")
 
 # Mapeamento inicial (exemplos desta conversa)
-default_map = {
-    "EVEN": "EVEN3",
-    "PETRORECSA": "RECV3",
-    "VULCABRAS": "VULC3",
-}
+default_map = {"EVEN": "EVEN3", "PETRORECSA": "RECV3", "VULCABRAS": "VULC3"}
 
 # Carregar mapeamento adicional
 if map_file is not None:
@@ -538,8 +449,11 @@ if not text:
     st.error("Não consegui extrair texto do PDF. Tente enviar um PDF com texto (não imagem) ou exporte novamente.")
     st.stop()
 
-# Detect provider (cosmética por enquanto; o parser tenta B3 e fallback genérico)
+# Detect provider and show badge (AGORA sim, depois do text)
 provider = detect_provider(text)
+_badge_cls = "badge-xp" if provider == "xp" else "badge-b3"
+_badge_label = provider.upper()
+st.markdown(f'<div class="muted">Provedor detectado: <span class="badge {_badge_cls}">{_badge_label}</span></div>', unsafe_allow_html=True)
 
 # Header info
 data_pregao_str, liquido_para_data_str, liquido_para_valor_str = parse_header_dates_and_net(text)
@@ -571,18 +485,11 @@ agg = (
          BaseRateio=("AbsValor", "sum"))
 )
 
-# Tentar inferir custos da nota
+# Custos padronizados B3/XP
 fees = parse_cost_components(text)
-
-# Cost components to include by default
 atomic_keys = ["liquidacao", "emolumentos", "registro", "corretagem", "taxa_operacional", "iss", "impostos", "outros"]
-# sum atomics if present; otherwise, fall back to aggregates substitute chosen in parse_cost_components
 atomics_sum = sum(fees.get(k, 0.0) for k in atomic_keys)
-if atomics_sum > 0:
-    total_costs_detected = round(atomics_sum, 2)
-else:
-    # use one of the *_subst inserted by parse_cost_components
-    total_costs_detected = round(sum(v for k, v in fees.items() if k.endswith("_subst")), 2)
+total_costs_detected = round(atomics_sum if atomics_sum > 0 else sum(v for k, v in fees.items() if k.endswith("_subst")), 2)
 
 # Campo para confirmar/ajustar total de custos a ratear
 st.subheader("Custos a ratear")
@@ -616,14 +523,13 @@ alloc_df.columns = ["Ativo", "Operação", "Custos"]
 out = agg.merge(alloc_df, on=["Ativo", "Operação"], how="left")
 out["Custos"] = out["Custos"].fillna(0.0)
 
-# Calcular Total conforme sua regra (módulo):
-# Venda (Valor < 0) => |Valor| - Custos ; Compra (Valor > 0) => |Valor| + Custos
+# Total (módulo): Venda => |Valor| - Custos ; Compra => |Valor| + Custos
 out["Total"] = out.apply(lambda r: abs(r["Valor"]) - r["Custos"] if r["Valor"] < 0 else abs(r["Valor"]) + r["Custos"], axis=1)
 
 # Preço médio = |Valor| / Quantidade (sem custos)
 out["Preço Médio"] = out.apply(lambda r: (abs(r["Valor"]) / r["Quantidade"]) if r["Quantidade"] else None, axis=1)
 
-# Ordenar por Ativo para uma leitura mais estável
+# Ordenar por Ativo
 out = out.sort_values(["Ativo", "Operação"]).reset_index(drop=True)
 
 # ===== Resultado (CARD) =====
@@ -652,7 +558,6 @@ if mostrar_cotacoes:
     with st.container():
         st.markdown('<div class="card">', unsafe_allow_html=True)
 
-        # Refresh button to clear cache and rerun
         colr1, colr2 = st.columns([1, 4])
         with colr1:
             if st.button("🔄 Atualizar cotações"):
