@@ -139,13 +139,6 @@ def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
 
     return "", "none"
 
-def detect_provider(text: str) -> str:
-    """Return 'xp' if XP keywords found; else 'b3'."""
-    t = strip_accents(text).lower()
-    if ("xp investimentos" in t) or ("xp inc" in t) or ("xp cctvm" in t) or ("xp investimentos cctvm" in t):
-        return "xp"
-    return "b3"
-
 def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     """Parse B3 'Negócios realizados' lines."""
     lines = text.splitlines()
@@ -212,6 +205,37 @@ def parse_trades_any(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     if df.empty:
         df = parse_trades_generic_table(text, name_to_ticker_map)
     return df
+
+def detect_layout(text: str) -> str:
+    """Detect document LAYOUT (B3 vs XP), not broker name."""
+    t = strip_accents(text).lower()
+    # Markers typical for B3 layout
+    b3_markers = [
+        "negocios realizados", "resumo dos negocios", "nota de corretagem",
+        "liquido para", "1-bovespa", "mercado a vista", "clearing"
+    ]
+    # Markers typical for XP 'comprovante' layout
+    xp_markers = [
+        "comprovante de negociacao", "produtos renda variavel",
+        "numero da nota", "canal de atendimento xp"
+    ]
+    b3_hits = sum(1 for m in b3_markers if m in t)
+    xp_hits = sum(1 for m in xp_markers if m in t)
+
+    # Heurística de contagem
+    if b3_hits >= max(2, xp_hits + 1):
+        return "B3"
+    if xp_hits >= max(2, b3_hits + 1):
+        return "XP"
+
+    # Empate: decide por qual parser funcionou melhor
+    try:
+        if not parse_trades_b3style(text, {}).empty:
+            return "B3"
+    except Exception:
+        pass
+    # Se chegou aqui, assuma XP só se houver "xp " explícito, senão B3
+    return "XP" if " xp" in t or t.startswith("xp") else "B3"
 
 def parse_header_dates_and_net(text: str):
     """Extract 'Data do pregão' and 'Líquido para <data> <valor>' robustly (B3/XP)."""
@@ -328,7 +352,7 @@ def allocate_costs_proportional(amounts: pd.Series, total_costs: float) -> pd.Se
     return floored
 
 def guess_yf_symbols_for_b3(ticker: str) -> list:
-    """Return likely Yahoo symbols for a B3 ticker ('.SA' suffix)."""
+    """Return likely Yahoo symbols for a B3 ticker."""
     if not ticker:
         return []
     t = ticker.strip().upper()
@@ -351,91 +375,106 @@ def _format_dt_local(dt) -> str:
         except Exception:
             return str(dt)
 
+def _pick_symbol_with_data(ticker: str) -> tuple[str|None, str]:
+    """Try symbol candidates and return the first that has *daily* data. Returns (symbol, note)."""
+    if yf is None:
+        return None, "yfinance ausente"
+    for sym in guess_yf_symbols_for_b3(ticker):
+        try:
+            hd = yf.Ticker(sym).history(period="10d", interval="1d", auto_adjust=False)
+            if not hd.empty and "Close" in hd and not hd["Close"].dropna().empty:
+                return sym, ""
+        except Exception as e:
+            last_err = str(e)
+    return None, "sem histórico diário"
+
 @st.cache_data(show_spinner=False, ttl=60)
 def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) -> pd.DataFrame:
     """
     Busca intraday (1m→5m→15m); se vazio (noite/feriado), usa fechamento e marca '(fechamento)'.
-    Preenche também 'Fechamento (pregão)' e 'Pregão (data)'.
+    Testa símbolos candidatos ('.SA' e sem sufixo). Sempre retorna uma linha por ticker.
     """
-    cols = ["Ticker", "Símbolo", "Último", "Último (quando)", "Fechamento (pregão)", "Pregão (data)"]
-    out_rows = []
+    cols = ["Ticker", "Símbolo", "Último", "Último (quando)", "Fechamento (pregão)", "Pregão (data)", "Motivo"]
+    rows = []
     if yf is None or not tickers:
         return pd.DataFrame(columns=cols)
 
     for t in tickers:
-        sym = guess_yf_symbols_for_b3(t)[0]
+        sym, note = _pick_symbol_with_data(t)
         last_px = None
         last_dt = None
         last_from_close = False
         close_px = None
         close_dt = None
+        motivo = note
 
-        # 1) Intraday fallback chain
-        for intr in ["1m", "5m", "15m"]:
+        if sym:
+            # 1) Intraday fallback chain
+            for intr in ["1m", "5m", "15m"]:
+                try:
+                    h = yf.Ticker(sym).history(period="5d", interval=intr, auto_adjust=False)
+                    if not h.empty and "Close" in h:
+                        s = h["Close"].dropna()
+                        if not s.empty:
+                            last_px = float(s.iloc[-1])
+                            idx = s.index[-1]
+                            if getattr(idx, "tzinfo", None) is None:
+                                idx = pd.Timestamp(idx).tz_localize(timezone.utc)
+                            last_dt = idx.tz_convert(TZ)
+                            break
+                except Exception:
+                    pass
+
+            # 2) Daily close (sempre)
             try:
-                h = yf.Ticker(sym).history(period="5d", interval=intr, auto_adjust=False)
-                if not h.empty and "Close" in h:
-                    s = h["Close"].dropna()
-                    if not s.empty:
-                        last_px = float(s.iloc[-1])
-                        idx = s.index[-1]
-                        if getattr(idx, "tzinfo", None) is None:
-                            idx = pd.Timestamp(idx).tz_localize(timezone.utc)
-                        last_dt = idx.tz_convert(TZ)
-                        break
+                if ref_date is None:
+                    hd = yf.Ticker(sym).history(period="10d", interval="1d", auto_adjust=False)
+                    if not hd.empty and "Close" in hd:
+                        s = hd["Close"].dropna()
+                        if not s.empty:
+                            close_px = float(s.iloc[-1])
+                            idx = s.index[-1]
+                            if getattr(idx, "tzinfo", None) is None:
+                                idx = pd.Timestamp(idx).tz_localize(timezone.utc)
+                            close_dt = idx.tz_convert(TZ)
+                else:
+                    start_daily = (ref_date - timedelta(days=7)).strftime("%Y-%m-%d")
+                    end_daily = (ref_date + timedelta(days=7)).strftime("%Y-%m-%d")
+                    hd = yf.Ticker(sym).history(start=start_daily, end=end_daily, auto_adjust=False)
+                    if not hd.empty and "Close" in hd:
+                        s = hd["Close"].dropna()
+                        if not s.empty:
+                            idxs = s.index[s.index.date <= ref_date.date()]
+                            if len(idxs) > 0:
+                                close_px = float(s.loc[idxs[-1]]); idx = idxs[-1]
+                            else:
+                                close_px = float(s.iloc[-1]); idx = s.index[-1]
+                            if getattr(idx, "tzinfo", None) is None:
+                                idx = pd.Timestamp(idx).tz_localize(timezone.utc)
+                            close_dt = idx.tz_convert(TZ)
             except Exception:
                 pass
 
-        # 2) Daily close
-        try:
-            if ref_date is None:
-                hd = yf.Ticker(sym).history(period="10d", interval="1d", auto_adjust=False)
-                if not hd.empty and "Close" in hd:
-                    s = hd["Close"].dropna()
-                    if not s.empty:
-                        close_px = float(s.iloc[-1])
-                        idx = s.index[-1]
-                        if getattr(idx, "tzinfo", None) is None:
-                            idx = pd.Timestamp(idx).tz_localize(timezone.utc)
-                        close_dt = idx.tz_convert(TZ)
-            else:
-                start_daily = (ref_date - timedelta(days=7)).strftime("%Y-%m-%d")
-                end_daily = (ref_date + timedelta(days=7)).strftime("%Y-%m-%d")
-                hd = yf.Ticker(sym).history(start=start_daily, end=end_daily, auto_adjust=False)
-                if not hd.empty and "Close" in hd:
-                    s = hd["Close"].dropna()
-                    if not s.empty:
-                        idxs = s.index[s.index.date <= ref_date.date()]
-                        if len(idxs) > 0:
-                            close_px = float(s.loc[idxs[-1]]); idx = idxs[-1]
-                        else:
-                            close_px = float(s.iloc[-1]); idx = s.index[-1]
-                        if getattr(idx, "tzinfo", None) is None:
-                            idx = pd.Timestamp(idx).tz_localize(timezone.utc)
-                        close_dt = idx.tz_convert(TZ)
-        except Exception:
-            pass
+            # 3) Use fechamento como 'Último' se intraday falhou
+            if last_px is None and close_px is not None:
+                last_px = close_px
+                last_dt = close_dt
+                last_from_close = True
 
-        # 3) Use fechamento como 'Último' se intraday falhou
-        if last_px is None and close_px is not None:
-            last_px = close_px
-            last_dt = close_dt
-            last_from_close = True
+            if last_px is None and not motivo:
+                motivo = "sem intraday/fechamento (falha de rede ou símbolo inválido?)"
 
-        when_str = _format_dt_local(last_dt)
-        if last_from_close and when_str:
-            when_str += " (fechamento)"
-
-        out_rows.append({
+        rows.append({
             "Ticker": t,
-            "Símbolo": sym,
+            "Símbolo": sym or "",
             "Último": last_px,
-            "Último (quando)": when_str,
+            "Último (quando)": (_format_dt_local(last_dt) + (" (fechamento)" if last_from_close and last_dt else "")) if last_dt else "",
             "Fechamento (pregão)": close_px,
             "Pregão (data)": close_dt.date().strftime("%d/%m/%Y") if close_dt else "",
+            "Motivo": motivo,
         })
 
-    return pd.DataFrame(out_rows, columns=cols)
+    return pd.DataFrame(rows, columns=cols)
 
 
 # ---------------------------
@@ -463,7 +502,6 @@ st.markdown('<div class="subtitle">Extraia, agregue e rateie custos por ativo (p
 
 with st.sidebar:
     st.header("Opções")
-    incluir_bovespa_soma = st.checkbox("Incluir 'Total Bovespa / Soma' nos custos para rateio", value=False)
     mostrar_cotacoes = st.checkbox("Mostrar cotações (yfinance)", value=True)
     st.markdown("---")
     st.subheader("Mapeamento opcional Nome→Ticker")
@@ -496,11 +534,10 @@ if not text:
     st.error("Não consegui extrair texto do PDF. Tente enviar um PDF com texto (não imagem) ou exporte novamente.")
     st.stop()
 
-# Provider + badge
-provider = detect_provider(text)
-_badge_cls = "badge-xp" if provider == "xp" else "badge-b3"
-_badge_label = provider.upper()
-st.markdown(f'<div class="muted">Provedor detectado: <span class="badge {_badge_cls}">{_badge_label}</span></div>', unsafe_allow_html=True)
+# Detect LAYOUT (B3 vs XP) e badge
+layout = detect_layout(text)
+_badge_cls = "badge-xp" if layout == "XP" else "badge-b3"
+st.markdown(f'<div class="muted">Layout detectado: <span class="badge {_badge_cls}">{layout}</span></div>', unsafe_allow_html=True)
 
 # Header info
 data_pregao_str, liquido_para_data_str, liquido_para_valor_str = parse_header_dates_and_net(text)
@@ -611,7 +648,7 @@ if mostrar_cotacoes:
                 st.cache_data.clear()
                 st.rerun()
         with colr2:
-            st.caption("Atualiza os dados intraday (1 minuto). Cache = 60s.")
+            st.caption("Atualiza os dados intraday (1m/5m/15m). Se indisponível, usa fechamento.")
 
         if yf is None:
             st.info("Pacote 'yfinance' não instalado. Para ver cotações, instale com: pip install yfinance")
@@ -625,20 +662,17 @@ if mostrar_cotacoes:
             tickers = sorted(out["Ativo"].unique().tolist())
             quotes = fetch_quotes_for_tickers(tickers, ref_date=ref_date)
             if not quotes.empty:
-                now_local = datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
-                st.caption(f"Agora (BRT): {now_local} • Fonte: Yahoo Finance")
                 qfmt = quotes.copy()
                 for c in ["Último", "Fechamento (pregão)"]:
                     qfmt[c] = qfmt[c].map(lambda x: brl(x) if pd.notna(x) else "")
                 st.dataframe(qfmt, use_container_width=True, hide_index=True)
             else:
-                st.info("Não foi possível obter cotações para os tickers detectados.")
+                st.info("Não foi possível obter cotações para os tickers detectados (lista vazia).")
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== Debug (Expander) =====
 with st.expander("🛠️ Debug (mostrar/ocultar)"):
-    st.text_area("Texto extraído (parcial)", value=text[:4000], height=200)
+    st.text_area("Texto extraído (parcial)", value=text[:4000], height=240)
     st.write("Extractor usado:", _extractor_used)
-    st.write("Provedor detectado:", provider)
-    st.write("Fees detectados:", fees)
+    st.write("Layout detectado:", layout)
     st.write("Agregado numérico:", out)
