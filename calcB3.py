@@ -1,7 +1,10 @@
 # calcB3.py
-# Streamlit app to parse B3/XP (Nota de Corretagem) PDFs, aggregate trades, allocate costs (by value),
-# compute average price, and show quotes with timestamps (intraday with nightly fallback).
-# Usage: streamlit run calcB3.py
+# Streamlit app para ler notas B3/XP (PDF), agregar negociações, ratear custos (pela base financeira),
+# calcular preço médio e exibir cotações (com fallback noturno).
+# Regra de custos a ratear (padrão):
+#   Total = Liquidação + Registro + Total Bovespa/Soma + Total Custos/Despesas
+# Se algum total não existir, reconstrói a parcela com componentes atômicos equivalentes.
+# Uso: streamlit run calcB3.py
 
 import io
 import re
@@ -13,7 +16,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-# Optional deps: pdfplumber (preferred), PyMuPDF (strong fallback), PyPDF2 (last), yfinance (quotes)
+# Deps opcionais (extratores PDF e cotações)
 try:
     import pdfplumber
 except Exception:
@@ -46,19 +49,17 @@ def strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
 def brl(v: float) -> str:
-    """Format number as Brazilian currency-like string without R$ prefix."""
     if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
         return ""
     s = f"{v:,.2f}"
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
 
 def parse_brl_number(s: str) -> float:
-    """Parse '1.234,56' -> 1234.56."""
     return float(s.replace(".", "").replace(",", "."))
 
 def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
-    """Extract text using multiple strategies. Returns (text, extractor_name)."""
-    # 1) pdfplumber strict
+    """Extrai texto por várias estratégias. Retorna (texto, nome_extrator)."""
+    # 1) pdfplumber (tolerâncias estritas)
     if pdfplumber is not None:
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -70,7 +71,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
                     return text, "pdfplumber (strict tol=1/1)"
         except Exception:
             pass
-        # 1b) pdfplumber default
+        # 1b) pdfplumber (padrão)
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                 text = ""
@@ -80,7 +81,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
                     return text, "pdfplumber (default tol)"
         except Exception:
             pass
-        # 1c) pdfplumber word reconstruction
+        # 1c) pdfplumber (reconstrução por palavras)
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                 chunks = []
@@ -144,25 +145,25 @@ def extract_b3_ticker(s: str) -> str | None:
     """
     Extrai um ticker brasileiro da string.
     Preferência: FII (4-6 letras + '11' + opcional 1 letra), depois ações/BDRs.
-    Exemplos válidos: VCJR11, HGLG11, PETR4, AAPL34, ABCDE11B
+    Exemplos: VCJR11, HGLG11, PETR4, AAPL34, ABCDE11B
     """
     s = strip_accents(s).upper()
-    # 1) FII prioritário: letras (4-6) + '11' + opcional letra
+    # 1) FII prioritário
     m = re.search(r"\b([A-Z]{4,6}11[A-Z]?)\b", s)
     if m:
         return m.group(1)
-    # 2) Geral: 4-5 letras + 1-2 dígitos + opcional letra (PETR4, AAPL34, ABCD11B)
+    # 2) Geral (ações/BDRs)
     m = re.search(r"\b([A-Z]{4,5}\d{1,2}[A-Z]?)\b", s)
     if m:
         return m.group(1)
-    # 3) Fallback mais permissivo: 3-5 letras + 1-2 dígitos
+    # 3) Fallback
     m = re.search(r"\b([A-Z]{3,5}\d{1,2})\b", s)
     if m:
         return m.group(1)
     return None
 
 def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
-    """Parse B3 'Negócios realizados' lines (inclui FIIs/BDRs)."""
+    """Linhas do tipo '1-BOVESPA C VISTA ... @ QTY PRICE VALUE D/C' (inclui FIIs/BDRs)."""
     lines = text.splitlines()
     trade_lines = [l for l in lines if ("BOVESPA" in l and "VISTA" in l and "@" in l)]
     pattern = re.compile(
@@ -170,7 +171,7 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
         r"(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<dc>[CD])"
     )
 
-    records = []
+    recs = []
     for line in trade_lines:
         m = pattern.search(line)
         if not m:
@@ -182,24 +183,21 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
         value = parse_brl_number(m.group("value"))
         dc = m.group("dc")
 
-        # Ticker direto na linha/spec (prioriza padrão FII)
         ticker = extract_b3_ticker(spec) or extract_b3_ticker(line)
         paper_name = spec
         if not ticker:
             ticker = name_to_ticker_map.get(paper_name.upper(), paper_name.upper())
 
-        records.append(
-            {
-                "Ativo": ticker,
-                "Nome": paper_name,
-                "Operação": "Compra" if cv == "C" else "Venda",
-                "Quantidade": qty,
-                "Preço_Unitário": price,
-                "Valor": value if cv == "C" else -value,  # vendas negativas
-                "Sinal_DC": dc,
-            }
-        )
-    return pd.DataFrame(records)
+        recs.append({
+            "Ativo": ticker,
+            "Nome": paper_name,
+            "Operação": "Compra" if cv == "C" else "Venda",
+            "Quantidade": qty,
+            "Preço_Unitário": price,
+            "Valor": value if cv == "C" else -value,
+            "Sinal_DC": dc,
+        })
+    return pd.DataFrame(recs)
 
 def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     """Fallback genérico: '<...> @ QTY PRICE VALUE' com ticker detectado na linha."""
@@ -208,7 +206,7 @@ def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFr
         r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?(?P<spec>.+?)@\s+"
         r"(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})"
     )
-    records = []
+    recs = []
     for line in lines:
         m = pattern.search(line)
         if not m:
@@ -225,18 +223,16 @@ def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFr
         if not ticker:
             ticker = name_to_ticker_map.get(paper_name.upper(), paper_name.upper())
 
-        records.append(
-            {
-                "Ativo": ticker,
-                "Nome": paper_name,
-                "Operação": "Compra" if cv == "C" else "Venda",
-                "Quantidade": qty,
-                "Preço_Unitário": price,
-                "Valor": value if cv == "C" else -value,
-                "Sinal_DC": "",
-            }
-        )
-    return pd.DataFrame(records)
+        recs.append({
+            "Ativo": ticker,
+            "Nome": paper_name,
+            "Operação": "Compra" if cv == "C" else "Venda",
+            "Quantidade": qty,
+            "Preço_Unitário": price,
+            "Valor": value if cv == "C" else -value,
+            "Sinal_DC": "",
+        })
+    return pd.DataFrame(recs)
 
 def parse_trades_any(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     df = parse_trades_b3style(text, name_to_ticker_map)
@@ -245,10 +241,10 @@ def parse_trades_any(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     return df
 
 def detect_layout(text: str) -> str:
-    """Detecta o LAYOUT do documento (B3 vs XP), não a corretora."""
+    """Detecta o LAYOUT (B3 vs XP), não a corretora."""
     t = strip_accents(text).lower()
 
-    # Indicadores fortes de XP (portal/impressão XP)
+    # Marcadores XP (comprovante/portal XP)
     xp_hits = 0
     for m in [
         "data da consulta", "data de referencia", "conta xp", "codigo assessor",
@@ -258,7 +254,7 @@ def detect_layout(text: str) -> str:
     ]:
         if m in t: xp_hits += 1
 
-    # Indicadores fortes de B3 "clássico"
+    # Marcadores B3 "clássico"
     b3_hits = 0
     for m in [
         "nota de negociacao", "resumo dos negocios", "total custos / despesas",
@@ -277,11 +273,10 @@ def detect_layout(text: str) -> str:
             return "B3"
     except Exception:
         pass
-    # Fallback conservador
     return "XP" if "conta xp" in t or "data da consulta" in t else "B3"
 
 def parse_header_dates_and_net(text: str):
-    """Extract 'Data do pregão' and 'Líquido para <data> <valor>' robustly (B3/XP)."""
+    """Extrai Data do Pregão / Líquido para <data/valor> de forma tolerante (B3/XP)."""
     lines = text.splitlines()
     pairs = list(zip(lines, [strip_accents(l).lower() for l in lines]))
 
@@ -326,89 +321,97 @@ def parse_header_dates_and_net(text: str):
 
     return data_pregao, liquido_para_data, liquido_para_valor
 
+
+# ---------------------------
+# Custos (extração e regra do rateio)
+# ---------------------------
+
 def parse_cost_components(text: str) -> dict:
     """
-    Extrai componentes de custo das notas B3/XP sem dupla contagem.
-    Por padrão, EXCLUI "Taxa de Transf. de Ativos" do rateio.
-    Retorna dicionário com componentes atômicos, agregados detectados e flags.
+    Extrai componentes/agrupados de custo (B3/XP) evitando dupla contagem.
+    Também padroniza rótulos de totais (B3: "Total Custos / Despesas"; XP: "Total Corretagem / Despesas").
     """
-    # Atomics (regex flexível)
-    pats = {
+    components = {}
+
+    # Atomics (rótulos mais comuns)
+    atom_pats = {
         "liquidacao": r"Taxa\s*de\s*liquida[cç][aã]o\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "emolumentos": r"Emolumentos\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "registro": r"Taxa\s*de\s*Registro\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        # Detectada mas EXCLUÍDA do rateio por padrão:
-        "transf_ativos_excl": r"Taxa\s*de\s*Transf\.\s*de\s*Ativos\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "transf_ativos": r"Taxa\s*de\s*Transf\.\s*de\s*Ativos\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "corretagem": r"Corretag\w*\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "taxa_operacional": r"(?:Taxa|Tarifa)\s*Operacion\w+\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "iss": r"\bISS\b.*?(\d{1,3}(?:\.\d{3})*,\d{2})",
         "impostos": r"\bImpostos\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "outros": r"\bOutros\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
     }
-    components = {}
-    for key, pat in pats.items():
+    for key, pat in atom_pats.items():
         m = re.search(pat, text, flags=re.IGNORECASE)
         if m:
             components[key] = parse_brl_number(m.group(1))
 
-    # Agregados (apenas fallback; não somar com atômicos)
-    aggregates = {}
-    agg_pats = {
+    # Totais / agregados (padronizados)
+    totals_pats = {
         "total_bovespa_soma": r"Total\s*Bovespa\s*/\s*Soma\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "taxas_b3": r"Taxas?\s*B3\s*[:\-]?\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
+        # B3 usa "Total Custos / Despesas"; XP costuma usar "Total Corretagem / Despesas"
         "total_custos_despesas": r"Total\s*(?:Custos|Corretagem)\s*/\s*Despesas\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        # Alguns PDFs trazem "Taxas B3" (soma de emolumentos+registro+transf etc.). Usado só como fallback.
+        "taxas_b3": r"Taxas?\s*B3\s*[:\-]?\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
     }
-    for key, pat in agg_pats.items():
+    for key, pat in totals_pats.items():
         m = re.search(pat, text, flags=re.IGNORECASE)
         if m:
-            aggregates[key] = parse_brl_number(m.group(1))
+            components[key] = parse_brl_number(m.group(1))
 
-    # IRRF (nunca vai para rateio)
-    irrf = None
+    # IRRF (para informação; fora do rateio)
     m_irrf = re.search(r"I\.?R\.?R\.?F\.?.*?(\d{1,3}(?:\.\d{3})*,\d{2})", text, flags=re.IGNORECASE)
     if m_irrf:
-        irrf = parse_brl_number(m_irrf.group(1))
+        components["_irrf"] = parse_brl_number(m_irrf.group(1))
 
-    # Soma atômica para rateio (EXCLUINDO transf. de ativos e registro)
-    atomic_included_keys = ["liquidacao", "emolumentos", "corretagem", "taxa_operacional", "iss", "impostos", "outros"]
-    atomic_total = sum(components.get(k, 0.0) for k in atomic_included_keys)
-
-    used_aggregate = False
-    if atomic_total == 0.0:
-        # Fallback: usa agregados na ordem (nunca mistura)
-        if "taxas_b3" in aggregates:
-            components["taxas_b3_subst"] = aggregates["taxas_b3"]; used_aggregate = True
-        elif "total_bovespa_soma" in aggregates:
-            components["total_bovespa_soma_subst"] = aggregates["total_bovespa_soma"]; used_aggregate = True
-        elif "total_custos_despesas" in aggregates:
-            components["custos_despesas_subst"] = aggregates["total_custos_despesas"]; used_aggregate = True
-
-    components["_aggregates_found"] = list(aggregates.keys())
-    components["_used_aggregate_substitute"] = used_aggregate
-    components["_irrf_detected"] = irrf
-    components["_atomic_included_keys"] = atomic_included_keys  # debug
     return components
 
-def allocate_costs_proportional(amounts: pd.Series, total_costs: float) -> pd.Series:
-    """Allocate total_costs across 'amounts' proportionally (by value), rounding to match exactly."""
-    if amounts.sum() <= 0 or total_costs <= 0:
-        return pd.Series([0.0] * len(amounts), index=amounts.index, dtype=float)
-    raw = amounts / amounts.sum() * total_costs
-    floored = (raw * 100).apply(math.floor) / 100.0
-    residual = round(total_costs - floored.sum(), 2)
-    if abs(residual) > 0:
-        frac = (raw * 100) - (raw * 100).apply(math.floor)
-        order = frac.sort_values(ascending=(residual < 0)).index
-        step = 0.01 if residual > 0 else -0.01
-        i = 0
-        while round(residual, 2) != 0 and i < len(order):
-            floored.loc[order[i]] += step
-            residual = round(residual - step, 2)
-            i += 1
-    return floored
+def compute_rateable_total(fees: dict) -> tuple[float, dict]:
+    """
+    Calcula o TOTAL para rateio seguindo a regra:
+      Liquidação + Registro + Total Bovespa/Soma + Total Custos/Despesas
+    Se algum total não existir, reconstrói a parcela correspondente via atômicos.
+    Retorna (total, detalhes_usados)
+    """
+    used = {}
+
+    liq = fees.get("liquidacao", 0.0); used["liquidacao"] = liq
+    reg = fees.get("registro", 0.0);   used["registro"] = reg
+
+    # Total Bovespa / Soma: se não existir, reconstrói com emolumentos + transf. de ativos (se houver)
+    tb = fees.get("total_bovespa_soma")
+    if tb is None:
+        tb = (fees.get("emolumentos", 0.0) + fees.get("transf_ativos", 0.0))
+        used["total_bovespa_soma_reconstr"] = tb
+    else:
+        used["total_bovespa_soma"] = tb
+
+    # Total Custos / Despesas: se não existir, reconstrói com corretagem|taxa_operacional + iss + impostos + outros
+    tcd = fees.get("total_custos_despesas")
+    if tcd is None:
+        # Alguns PDFs usam "corretagem", outros "taxa_operacional"
+        base_cor = fees.get("corretagem", 0.0)
+        if base_cor == 0.0:
+            base_cor = fees.get("taxa_operacional", 0.0)
+        tcd = base_cor + fees.get("iss", 0.0) + fees.get("impostos", 0.0) + fees.get("outros", 0.0)
+        used["total_custos_despesas_reconstr"] = tcd
+    else:
+        used["total_custos_despesas"] = tcd
+
+    total = round(liq + reg + tb + tcd, 2)
+    used["__total_rateio"] = total
+    return total, used
+
+
+# ---------------------------
+# Cotações (yfinance)
+# ---------------------------
 
 def guess_yf_symbols_for_b3(ticker: str) -> list:
-    """Return likely Yahoo symbols for a B3 ticker."""
     if not ticker:
         return []
     t = ticker.strip().upper()
@@ -432,7 +435,6 @@ def _format_dt_local(dt) -> str:
             return str(dt)
 
 def _pick_symbol_with_data(ticker: str) -> tuple[str|None, str]:
-    """Try symbol candidates and return the first that has *daily* data. Returns (symbol, note)."""
     if yf is None:
         return None, "yfinance ausente"
     last_err = ""
@@ -447,10 +449,6 @@ def _pick_symbol_with_data(ticker: str) -> tuple[str|None, str]:
 
 @st.cache_data(show_spinner=False, ttl=60)
 def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) -> pd.DataFrame:
-    """
-    Busca intraday (1m→5m→15m); se vazio (noite/feriado), usa fechamento e marca '(fechamento)'.
-    Testa símbolos candidatos ('.SA' e sem sufixo). Sempre retorna uma linha por ticker.
-    """
     cols = ["Ticker", "Símbolo", "Último", "Último (quando)", "Fechamento (pregão)", "Pregão (data)", "Motivo"]
     rows = []
     if yf is None or not tickers:
@@ -466,7 +464,7 @@ def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) ->
         motivo = note
 
         if sym:
-            # 1) Intraday fallback chain
+            # Intraday 1m → 5m → 15m
             for intr in ["1m", "5m", "15m"]:
                 try:
                     h = yf.Ticker(sym).history(period="5d", interval=intr, auto_adjust=False)
@@ -482,7 +480,7 @@ def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) ->
                 except Exception:
                     pass
 
-            # 2) Daily close (sempre)
+            # Fechamento (diário)
             try:
                 if ref_date is None:
                     hd = yf.Ticker(sym).history(period="10d", interval="1d", auto_adjust=False)
@@ -512,14 +510,13 @@ def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) ->
             except Exception:
                 pass
 
-            # 3) Use fechamento como 'Último' se intraday falhou
             if last_px is None and close_px is not None:
                 last_px = close_px
                 last_dt = close_dt
                 last_from_close = True
 
             if last_px is None and not motivo:
-                motivo = "sem intraday/fechamento (falha de rede ou símbolo inválido?)"
+                motivo = "sem intraday/fechamento (rede ou símbolo inválido?)"
 
         rows.append({
             "Ticker": t,
@@ -535,7 +532,7 @@ def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) ->
 
 
 # ---------------------------
-# Streamlit UI
+# UI
 # ---------------------------
 
 st.set_page_config(page_title="Calc B3 - Nota de Corretagem", layout="wide")
@@ -559,17 +556,16 @@ st.markdown('<div class="subtitle">Extraia, agregue e rateie custos por ativo (p
 
 with st.sidebar:
     st.header("Opções")
-    incluir_transf_ativos = st.checkbox("Incluir 'Transf. de Ativos' no rateio (normalmente NÃO)", value=False)
     mostrar_cotacoes = st.checkbox("Mostrar cotações (yfinance)", value=True)
     st.markdown("---")
     st.subheader("Mapeamento opcional Nome→Ticker")
-    st.write("Se sua nota usa **nome da empresa** (ex.: VULCABRAS) ao invés do ticker (VULC3/VCJR11), forneça um CSV `Nome,Ticker`.")
+    st.write("Se a nota usa **nome da empresa** (ex.: VULCABRAS) em vez do ticker (VULC3/VCJR11), forneça um CSV `Nome,Ticker`.")
     map_file = st.file_uploader("Upload CSV de mapeamento (opcional)", type=["csv"], key="map_csv")
 
 # Mapeamento inicial (exemplos)
 default_map = {"EVEN": "EVEN3", "PETRORECSA": "RECV3", "VULCABRAS": "VULC3"}
 
-# Carregar mapeamento adicional
+# CSV extra
 if map_file is not None:
     try:
         mdf = pd.read_csv(map_file)
@@ -585,22 +581,20 @@ if uploaded is None:
     st.info("Envie um arquivo PDF de nota B3/XP para começar.")
     st.stop()
 
-# Parse PDF text
+# Extrair texto
 pdf_bytes = uploaded.read()
 text, _extractor_used = extract_text_from_pdf(pdf_bytes)
 if not text:
     st.error("Não consegui extrair texto do PDF. Tente enviar um PDF com texto (não imagem) ou exporte novamente.")
     st.stop()
 
-# Detect LAYOUT (B3 vs XP) e badge
+# Layout badge
 layout = detect_layout(text)
 _badge_cls = "badge-xp" if layout == "XP" else "badge-b3"
 st.markdown(f'<div class="muted">Layout detectado: <span class="badge {_badge_cls}">{layout}</span></div>', unsafe_allow_html=True)
 
-# Header info
+# Datas topo
 data_pregao_str, liquido_para_data_str, liquido_para_valor_str = parse_header_dates_and_net(text)
-
-# Header cards
 colA, colB, colC, colD = st.columns(4)
 with colA:
     st.markdown('<div class="card"><div class="section-title">Data do Pregão</div><div class="muted">{}</div></div>'.format(data_pregao_str or "—"), unsafe_allow_html=True)
@@ -612,13 +606,13 @@ with colD:
     now_local = datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
     st.markdown('<div class="card"><div class="section-title">Agora (BRT)</div><div class="muted">{}</div></div>'.format(now_local), unsafe_allow_html=True)
 
-# Trades
+# Negociações
 df_trades = parse_trades_any(text, default_map)
 if df_trades.empty:
-    st.error("Não encontrei linhas de negociação. Tente: (i) subir o PDF original (não imagem), (ii) enviar um mapeamento Nome→Ticker ou (iii) compartilhar um PDF XP/B3 de exemplo para adaptar o parser.")
+    st.error("Não encontrei linhas de negociação. Tente: (i) subir o PDF original (não imagem) ou (ii) enviar um CSV Nome→Ticker.")
     st.stop()
 
-# Agrupar por Ativo + Operação (base de rateio = valor financeiro absoluto)
+# Agregação por Ativo/Operação (base p/ rateio = valor absoluto)
 df_trades["AbsValor"] = df_trades["Valor"].abs()
 agg = (
     df_trades.groupby(["Ativo", "Operação"], as_index=False)
@@ -627,55 +621,55 @@ agg = (
          BaseRateio=("AbsValor", "sum"))
 )
 
-# Custos padronizados B3/XP
+# Custos detectados + regra do total
 fees = parse_cost_components(text)
-atomic_keys = ["liquidacao", "emolumentos", "corretagem", "taxa_operacional", "iss", "impostos", "outros"]
-atomics_sum = sum(fees.get(k, 0.0) for k in atomic_keys)
-total_costs_detected = round(atomics_sum if atomics_sum > 0 else sum(v for k, v in fees.items() if k.endswith("_subst")), 2)
+total_detected, used_detail = compute_rateable_total(fees)
 
-# (Opcional) incluir "Transf. de Ativos" no rateio, se usuário quiser
-if incluir_transf_ativos:
-    total_costs_detected = round(total_costs_detected + fees.get("transf_ativos_excl", 0.0), 2)
-
-# Campo para confirmar/ajustar total de custos a ratear
 st.subheader("Custos a ratear")
 col1, col2 = st.columns([1, 3])
 with col1:
-    st.write("Componentes detectados:")
+    st.write("Componentes detectados (brutos):")
 with col2:
-    if fees:
-        shown = {k: f"R$ {brl(v)}" for k, v in fees.items() if not k.startswith("_")}
-        st.write(shown if shown else "(nenhum componente detectado)")
-        if fees.get("_irrf_detected"):
-            st.caption(f"IRRF detectado (não incluído no rateio): R$ {brl(fees['_irrf_detected'])}")
-        if fees.get("_used_aggregate_substitute"):
-            st.caption("Usando subtotal agregado (ex.: 'Taxas B3') como substituto por falta de componentes atômicos.")
+    shown = {k: f"R$ {brl(v)}" for k, v in fees.items() if not k.startswith("_")}
+    st.write(shown if shown else "(nenhum)")
+    st.caption("Regra padrão: Liquidação + Registro + Total Bovespa/Soma + Total Custos/Despesas.")
+    st.caption(f"Total (regra padrão) detectado: **R$ {brl(total_detected)}**")
 
+# Campo para ajuste manual
 total_costs_input = st.number_input(
-    "Total de custos para **rateio** (proporcional ao valor financeiro)",
+    "Total de custos para **rateio** (pode ajustar)",
     min_value=0.0,
-    value=round(total_costs_detected, 2),
+    value=round(total_detected, 2),
     step=0.01,
     format="%.2f",
-    help="Soma das taxas que deseja distribuir entre os ativos. Ajuste se necessário para casar com seus 'Custos' esperados."
+    help="Se desejar, ajuste manualmente para casar 100% com sua expectativa."
 )
 
-# Rateio por (Ativo, Operação)
-alloc_series = allocate_costs_proportional(agg.set_index(["Ativo", "Operação"])["BaseRateio"], total_costs_input)
-alloc_df = alloc_series.reset_index()
+# Rateio proporcional ao valor financeiro
+alloc_series = (agg.set_index(["Ativo", "Operação"])["BaseRateio"])
+alloc_series = alloc_series / alloc_series.sum() * total_costs_input if alloc_series.sum() > 0 else alloc_series*0
+# Correção de arredondamento (centavos)
+floored = (alloc_series * 100).apply(math.floor) / 100.0
+residual = round(total_costs_input - floored.sum(), 2)
+if abs(residual) > 0:
+    frac = (alloc_series * 100) - (alloc_series * 100).apply(math.floor)
+    order = frac.sort_values(ascending=(residual < 0)).index
+    step = 0.01 if residual > 0 else -0.01
+    i = 0
+    while round(residual, 2) != 0 and i < len(order):
+        floored.loc[order[i]] += step
+        residual = round(residual - step, 2)
+        i += 1
+alloc_df = floored.reset_index()
 alloc_df.columns = ["Ativo", "Operação", "Custos"]
 
-# Merge com agregação
+# Merge + métricas finais
 out = agg.merge(alloc_df, on=["Ativo", "Operação"], how="left")
 out["Custos"] = out["Custos"].fillna(0.0)
-
 # Total (módulo): Venda => |Valor| - Custos ; Compra => |Valor| + Custos
 out["Total"] = out.apply(lambda r: abs(r["Valor"]) - r["Custos"] if r["Valor"] < 0 else abs(r["Valor"]) + r["Custos"], axis=1)
-
 # Preço médio = |Valor| / Quantidade (sem custos)
 out["Preço Médio"] = out.apply(lambda r: (abs(r["Valor"]) / r["Quantidade"]) if r["Quantidade"] else None, axis=1)
-
-# Ordenar por Ativo
 out = out.sort_values(["Ativo", "Operação"]).reset_index(drop=True)
 
 # ===== Resultado (CARD) =====
@@ -710,7 +704,7 @@ if mostrar_cotacoes:
                 st.cache_data.clear()
                 st.rerun()
         with colr2:
-            st.caption("Atualiza intraday (1m/5m/15m). Se indisponível, usa fechamento (marcado).")
+            st.caption("Busca intraday 1m/5m/15m; se indisponível, usa fechamento (marcado).")
 
         if yf is None:
             st.info("Pacote 'yfinance' não instalado. Para ver cotações, instale com: pip install yfinance")
@@ -729,7 +723,7 @@ if mostrar_cotacoes:
                     qfmt[c] = qfmt[c].map(lambda x: brl(x) if pd.notna(x) else "")
                 st.dataframe(qfmt, use_container_width=True, hide_index=True)
             else:
-                st.info("Não foi possível obter cotações para os tickers detectados (lista vazia).")
+                st.info("Não foi possível obter cotações para os tickers detectados.")
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== Debug (Expander) =====
@@ -737,5 +731,6 @@ with st.expander("🛠️ Debug (mostrar/ocultar)"):
     st.text_area("Texto extraído (parcial)", value=text[:4000], height=240)
     st.write("Extractor usado:", _extractor_used)
     st.write("Layout detectado:", layout)
-    st.write("Fees detectados:", parse_cost_components(text))
+    st.write("Fees detectados:", fees)
+    st.write("Cálculo do total (regra padrão):", used_detail)
     st.write("Agregado numérico:", out)
