@@ -30,12 +30,6 @@ try:
 except Exception:
     yf = None
 
-# PyMuPDF (fitz) for robust text extraction
-try:
-    import fitz  # PyMuPDF
-except Exception:
-    fitz = None
-
 
 # ---------------------------
 # Helpers
@@ -61,96 +55,25 @@ def parse_brl_number(s: str) -> float:
     return float(s.replace(".", "").replace(",", "."))
 
 
-def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
-    """Extract text from a PDF file using multiple strategies.
-    Returns (text, extractor_name).
-    """
-    # 1) pdfplumber strict
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Extract text from a PDF file using pdfplumber (preferred) or PyPDF2."""
+    text = ""
     if pdfplumber is not None:
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                text = ""
                 for page in pdf.pages:
                     page_text = page.extract_text(x_tolerance=1, y_tolerance=1) or ""
                     text += page_text + "\n"
-                if text.strip():
-                    return text, "pdfplumber (strict tol=1/1)"
         except Exception:
-            pass
-        # 1b) pdfplumber relaxed/default
-        try:
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                text = ""
-                for page in pdf.pages:
-                    page_text = page.extract_text() or ""
-                    text += page_text + "\n"
-                if text.strip():
-                    return text, "pdfplumber (default tol)"
-        except Exception:
-            pass
-        # 1c) pdfplumber word reconstruction
-        try:
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                chunks = []
-                for page in pdf.pages:
-                    words = page.extract_words(use_text_flow=True) or []
-                    if words:
-                        # Rebuild by increasing x0 to keep reading order
-                        words_sorted = sorted(words, key=lambda w: (round(w.get('top', 0), 1), w.get('x0', 0)))
-                        line_y = None
-                        line_words = []
-                        for w in words_sorted:
-                            y = round(w.get('top', 0), 1)
-                            txt = w.get("text", "")
-                            if line_y is None:
-                                line_y = y
-                            if abs(y - line_y) > 0.8:
-                                chunks.append(" ".join(line_words))
-                                line_words = [txt]
-                                line_y = y
-                            else:
-                                line_words.append(txt)
-                        if line_words:
-                            chunks.append(" ".join(line_words))
-                text = "\n".join(chunks)
-                if text.strip():
-                    return text, "pdfplumber (reconstructed words)"
-        except Exception:
-            pass
-
-    # 2) PyMuPDF fallback
-    if fitz is not None:
-        try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            pieces = []
-            for page in doc:
-                pieces.append(page.get_text("text"))
-            text = "\n".join(pieces)
-            if text.strip():
-                return text, "PyMuPDF (fitz)"
-        except Exception:
-            pass
-
-    # 3) PyPDF2 fallback
-    if PyPDF2 is not None:
+            text = ""
+    if not text and PyPDF2 is not None:
         try:
             reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-            # If encrypted, try decrypt empty password
-            if getattr(reader, "is_encrypted", False):
-                try:
-                    reader.decrypt('')
-                except Exception:
-                    pass
-            text = ""
             for page in reader.pages:
-                page_text = page.extract_text() or ""
-                text += page_text + "\n"
-            if text.strip():
-                return text, "PyPDF2"
+                text += (page.extract_text() or "") + "\n"
         except Exception:
-            pass
-
-    return "", "none"
+            text = ""
+    return text
 
 
 def detect_provider(text: str) -> str:
@@ -545,7 +468,7 @@ if uploaded is None:
 
 # Parse PDF text
 pdf_bytes = uploaded.read()
-text, _extractor_used = extract_text_from_pdf(pdf_bytes)
+text = extract_text_from_pdf(pdf_bytes)
 if not text:
     st.error("Não consegui extrair texto do PDF. Tente enviar um PDF com texto (não imagem) ou exporte novamente.")
     st.stop()
@@ -702,7 +625,6 @@ if mostrar_cotacoes:
 # ===== Debug (Expander) =====
 with st.expander("🛠️ Debug (mostrar/ocultar)"):
     st.text_area("Texto extraído (parcial)", value=text[:4000], height=200)
-    st.write("Extractor usado:", _extractor_used)
     st.write("Provedor detectado:", provider)
     st.write("Fees detectados:", fees)
     st.write("Agregado numérico:", out)
