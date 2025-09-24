@@ -139,42 +139,73 @@ def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
 
     return "", "none"
 
+# --- ticker extraction (prioriza FII: ...11) ---
+def extract_b3_ticker(s: str) -> str | None:
+    """
+    Extrai um ticker brasileiro da string.
+    Preferência: FII (4-6 letras + '11' + opcional 1 letra), depois ações/BDRs.
+    Exemplos válidos: VCJR11, HGLG11, PETR4, AAPL34, ABCDE11B
+    """
+    s = strip_accents(s).upper()
+    # 1) FII prioritário: letras (4-6) + '11' + opcional letra
+    m = re.search(r"\b([A-Z]{4,6}11[A-Z]?)\b", s)
+    if m:
+        return m.group(1)
+    # 2) Geral: 4-5 letras + 2 dígitos + opcional letra (PETR4, AAPL34, ABCD11B)
+    m = re.search(r"\b([A-Z]{4,5}\d{1,2}[A-Z]?)\b", s)
+    if m:
+        return m.group(1)
+    # 3) Fallback mais permissivo: 3-5 letras + 1-2 dígitos
+    m = re.search(r"\b([A-Z]{3,5}\d{1,2})\b", s)
+    if m:
+        return m.group(1)
+    return None
+
 def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
-    """Parse B3 'Negócios realizados' lines."""
+    """Parse B3 'Negócios realizados' lines (inclui FIIs/BDRs)."""
     lines = text.splitlines()
     trade_lines = [l for l in lines if ("BOVESPA" in l and "VISTA" in l and "@" in l)]
     pattern = re.compile(
-        r"BOVESPA\s+(?P<cv>[CV])\s+VISTA\s+(?P<paper>[A-Z0-9ÇÃÕÉÊÍÓÚA-Z ]+?)\s+.*?@\s+"
+        r"BOVESPA\s+(?P<cv>[CV])\s+VISTA\s+(?P<spec>.+?)@\s+"
         r"(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<dc>[CD])"
     )
+
     records = []
     for line in trade_lines:
         m = pattern.search(line)
         if not m:
             continue
         cv = m.group("cv")
-        paper_name = m.group("paper").strip()
+        spec = re.sub(r"\s+", " ", m.group("spec")).strip()
         qty = int(m.group("qty"))
         price = parse_brl_number(m.group("price"))
         value = parse_brl_number(m.group("value"))
         dc = m.group("dc")
-        ticker = name_to_ticker_map.get(paper_name, paper_name)
-        records.append({
-            "Ativo": ticker,
-            "Nome": paper_name,
-            "Operação": "Compra" if cv == "C" else "Venda",
-            "Quantidade": qty,
-            "Preço_Unitário": price,
-            "Valor": value if cv == "C" else -value,
-            "Sinal_DC": dc,
-        })
+
+        # Ticker direto na linha/spec (prioriza padrão FII)
+        ticker = extract_b3_ticker(spec) or extract_b3_ticker(line)
+        paper_name = spec
+        if not ticker:
+            ticker = name_to_ticker_map.get(paper_name.upper(), paper_name.upper())
+
+        records.append(
+            {
+                "Ativo": ticker,
+                "Nome": paper_name,
+                "Operação": "Compra" if cv == "C" else "Venda",
+                "Quantidade": qty,
+                "Preço_Unitário": price,
+                "Valor": value if cv == "C" else -value,  # vendas negativas
+                "Sinal_DC": dc,
+            }
+        )
     return pd.DataFrame(records)
 
 def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
-    """Generic fallback parser for lines like '<NAME> ... @ <QTY> <PRICE> <VALUE>'."""
+    """Fallback genérico: '<...> @ QTY PRICE VALUE' com ticker detectado na linha."""
     lines = [l for l in text.splitlines() if "@" in l and re.search(r"\d{1,3}(?:\.\d{3})*,\d{2}", l)]
     pattern = re.compile(
-        r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?(?P<paper>[A-Z0-9ÇÃÕÉÊÍÓÚA-Z ]{3,})\s+.*?@\s+"
+        r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?(?P<spec>.+?)@\s+"
         r"(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})"
     )
     records = []
@@ -184,20 +215,27 @@ def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFr
             continue
         cv_raw = m.group("cv").strip().upper()
         cv = "C" if cv_raw.startswith("C") else "V"
-        paper_name = m.group("paper").strip()
+        spec = re.sub(r"\s+", " ", m.group("spec")).strip()
         qty = int(m.group("qty"))
         price = parse_brl_number(m.group("price"))
         value = parse_brl_number(m.group("value"))
-        ticker = name_to_ticker_map.get(paper_name, paper_name)
-        records.append({
-            "Ativo": ticker,
-            "Nome": paper_name,
-            "Operação": "Compra" if cv == "C" else "Venda",
-            "Quantidade": qty,
-            "Preço_Unitário": price,
-            "Valor": value if cv == "C" else -value,
-            "Sinal_DC": "",
-        })
+
+        ticker = extract_b3_ticker(spec) or extract_b3_ticker(line)
+        paper_name = spec
+        if not ticker:
+            ticker = name_to_ticker_map.get(paper_name.upper(), paper_name.upper())
+
+        records.append(
+            {
+                "Ativo": ticker,
+                "Nome": paper_name,
+                "Operação": "Compra" if cv == "C" else "Venda",
+                "Quantidade": qty,
+                "Preço_Unitário": price,
+                "Valor": value if cv == "C" else -value,
+                "Sinal_DC": "",
+            }
+        )
     return pd.DataFrame(records)
 
 def parse_trades_any(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
@@ -222,19 +260,17 @@ def detect_layout(text: str) -> str:
     b3_hits = sum(1 for m in b3_markers if m in t)
     xp_hits = sum(1 for m in xp_markers if m in t)
 
-    # Heurística de contagem
     if b3_hits >= max(2, xp_hits + 1):
         return "B3"
     if xp_hits >= max(2, b3_hits + 1):
         return "XP"
 
-    # Empate: decide por qual parser funcionou melhor
+    # Empate → decide por qual parser funcionou melhor
     try:
         if not parse_trades_b3style(text, {}).empty:
             return "B3"
     except Exception:
         pass
-    # Se chegou aqui, assuma XP só se houver "xp " explícito, senão B3
     return "XP" if " xp" in t or t.startswith("xp") else "B3"
 
 def parse_header_dates_and_net(text: str):
@@ -379,6 +415,7 @@ def _pick_symbol_with_data(ticker: str) -> tuple[str|None, str]:
     """Try symbol candidates and return the first that has *daily* data. Returns (symbol, note)."""
     if yf is None:
         return None, "yfinance ausente"
+    last_err = ""
     for sym in guess_yf_symbols_for_b3(ticker):
         try:
             hd = yf.Ticker(sym).history(period="10d", interval="1d", auto_adjust=False)
@@ -386,7 +423,7 @@ def _pick_symbol_with_data(ticker: str) -> tuple[str|None, str]:
                 return sym, ""
         except Exception as e:
             last_err = str(e)
-    return None, "sem histórico diário"
+    return None, ("sem histórico diário" if not last_err else last_err)
 
 @st.cache_data(show_spinner=False, ttl=60)
 def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) -> pd.DataFrame:
@@ -505,7 +542,7 @@ with st.sidebar:
     mostrar_cotacoes = st.checkbox("Mostrar cotações (yfinance)", value=True)
     st.markdown("---")
     st.subheader("Mapeamento opcional Nome→Ticker")
-    st.write("Se sua nota usa **nome da empresa** (ex.: VULCABRAS) ao invés do ticker (VULC3), forneça um CSV `Nome,Ticker`.")
+    st.write("Se sua nota usa **nome da empresa** (ex.: VULCABRAS) ao invés do ticker (VULC3/VCJR11), forneça um CSV `Nome,Ticker`.")
     map_file = st.file_uploader("Upload CSV de mapeamento (opcional)", type=["csv"], key="map_csv")
 
 # Mapeamento inicial (exemplos)
@@ -557,7 +594,7 @@ with colD:
 # Trades
 df_trades = parse_trades_any(text, default_map)
 if df_trades.empty:
-    st.error("Não encontrei linhas de negociação. Tente: (i) subir o PDF original (não imagem), (ii) enviar um mapeamento Nome→Ticker ou (iii) compartilhar um PDF XP de exemplo para que eu adapte o parser.")
+    st.error("Não encontrei linhas de negociação. Tente: (i) subir o PDF original (não imagem), (ii) enviar um mapeamento Nome→Ticker ou (iii) compartilhar um PDF XP/B3 de exemplo para adaptar o parser.")
     st.stop()
 
 # Agrupar por Ativo + Operação (base de rateio = valor financeiro absoluto)
@@ -648,7 +685,7 @@ if mostrar_cotacoes:
                 st.cache_data.clear()
                 st.rerun()
         with colr2:
-            st.caption("Atualiza os dados intraday (1m/5m/15m). Se indisponível, usa fechamento.")
+            st.caption("Atualiza intraday (1m/5m/15m). Se indisponível, usa fechamento (marcado).")
 
         if yf is None:
             st.info("Pacote 'yfinance' não instalado. Para ver cotações, instale com: pip install yfinance")
