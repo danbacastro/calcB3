@@ -151,7 +151,7 @@ def extract_b3_ticker(s: str) -> str | None:
     m = re.search(r"\b([A-Z]{4,6}11[A-Z]?)\b", s)
     if m:
         return m.group(1)
-    # 2) Geral: 4-5 letras + 2 dígitos + opcional letra (PETR4, AAPL34, ABCD11B)
+    # 2) Geral: 4-5 letras + 1-2 dígitos + opcional letra (PETR4, AAPL34, ABCD11B)
     m = re.search(r"\b([A-Z]{4,5}\d{1,2}[A-Z]?)\b", s)
     if m:
         return m.group(1)
@@ -245,33 +245,40 @@ def parse_trades_any(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     return df
 
 def detect_layout(text: str) -> str:
-    """Detect document LAYOUT (B3 vs XP), not broker name."""
+    """Detecta o LAYOUT do documento (B3 vs XP), não a corretora."""
     t = strip_accents(text).lower()
-    # Markers typical for B3 layout
-    b3_markers = [
-        "negocios realizados", "resumo dos negocios", "nota de corretagem",
-        "liquido para", "1-bovespa", "mercado a vista", "clearing"
-    ]
-    # Markers typical for XP 'comprovante' layout
-    xp_markers = [
-        "comprovante de negociacao", "produtos renda variavel",
-        "numero da nota", "canal de atendimento xp"
-    ]
-    b3_hits = sum(1 for m in b3_markers if m in t)
-    xp_hits = sum(1 for m in xp_markers if m in t)
 
-    if b3_hits >= max(2, xp_hits + 1):
-        return "B3"
+    # Indicadores fortes de XP (portal/impressão XP)
+    xp_hits = 0
+    for m in [
+        "data da consulta", "data de referencia", "conta xp", "codigo assessor",
+        "corretagem / despesas",  # label típico do quadro XP
+        "atendimento ao cliente: +55 11 4003-3710", "ouvidoria: 0800 722 3730",
+        "xp investimentos cctvm", "https://www.xpi.com.br/"
+    ]:
+        if m in t: xp_hits += 1
+
+    # Indicadores fortes de B3 "clássico"
+    b3_hits = 0
+    for m in [
+        "nota de negociacao", "resumo dos negocios", "total custos / despesas",
+        "total bovespa / soma", "cblc", "liquido para", "clearing", "1-bovespa"
+    ]:
+        if m in t: b3_hits += 1
+
     if xp_hits >= max(2, b3_hits + 1):
         return "XP"
+    if b3_hits >= max(2, xp_hits + 1):
+        return "B3"
 
-    # Empate → decide por qual parser funcionou melhor
+    # Desempate: se o parser B3-style encontra linhas, tende a ser layout B3
     try:
         if not parse_trades_b3style(text, {}).empty:
             return "B3"
     except Exception:
         pass
-    return "XP" if " xp" in t or t.startswith("xp") else "B3"
+    # Fallback conservador
+    return "XP" if "conta xp" in t or "data da consulta" in t else "B3"
 
 def parse_header_dates_and_net(text: str):
     """Extract 'Data do pregão' and 'Líquido para <data> <valor>' robustly (B3/XP)."""
@@ -320,14 +327,21 @@ def parse_header_dates_and_net(text: str):
     return data_pregao, liquido_para_data, liquido_para_valor
 
 def parse_cost_components(text: str) -> dict:
-    """Canonicalize cost components (B3/XP) and avoid double counting."""
+    """
+    Extrai componentes de custo das notas B3/XP sem dupla contagem.
+    Por padrão, EXCLUI "Taxa de Transf. de Ativos" do rateio.
+    Retorna dicionário com componentes atômicos, agregados detectados e flags.
+    """
+    # Atomics (regex flexível)
     pats = {
         "liquidacao": r"Taxa\s*de\s*liquida[cç][aã]o\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "emolumentos": r"Emolumentos\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "registro": r"(?:Taxa\s*de\s*Registro|Taxa\s*de\s*Transf\.\s*de\s*Ativos)\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "registro": r"Taxa\s*de\s*Registro\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        # Detectada mas EXCLUÍDA do rateio por padrão:
+        "transf_ativos_excl": r"Taxa\s*de\s*Transf\.\s*de\s*Ativos\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "corretagem": r"Corretag\w*\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "taxa_operacional": r"(?:Taxa|Tarifa)\s*Operacion\w+\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "iss": r"\bISS\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "iss": r"\bISS\b.*?(\d{1,3}(?:\.\d{3})*,\d{2})",
         "impostos": r"\bImpostos\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "outros": r"\bOutros\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
     }
@@ -337,26 +351,31 @@ def parse_cost_components(text: str) -> dict:
         if m:
             components[key] = parse_brl_number(m.group(1))
 
+    # Agregados (apenas fallback; não somar com atômicos)
     aggregates = {}
     agg_pats = {
         "total_bovespa_soma": r"Total\s*Bovespa\s*/\s*Soma\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "taxas_b3": r"Taxas?\s*B3\s*[:\-]?\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "total_custos_despesas": r"Total\s*Custos\s*/\s*Despesas\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        "custos_despesas": r"\bCustos\s*/\s*Despesas\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
+        "total_custos_despesas": r"Total\s*(?:Custos|Corretagem)\s*/\s*Despesas\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
     }
     for key, pat in agg_pats.items():
         m = re.search(pat, text, flags=re.IGNORECASE)
         if m:
             aggregates[key] = parse_brl_number(m.group(1))
 
+    # IRRF (nunca vai para rateio)
     irrf = None
     m_irrf = re.search(r"I\.?R\.?R\.?F\.?.*?(\d{1,3}(?:\.\d{3})*,\d{2})", text, flags=re.IGNORECASE)
     if m_irrf:
         irrf = parse_brl_number(m_irrf.group(1))
 
-    atomic_total = sum(components.values()) if components else 0.0
+    # Soma atômica para rateio (EXCLUINDO transf. de ativos e registro)
+    atomic_included_keys = ["liquidacao", "emolumentos", "corretagem", "taxa_operacional", "iss", "impostos", "outros"]
+    atomic_total = sum(components.get(k, 0.0) for k in atomic_included_keys)
+
     used_aggregate = False
     if atomic_total == 0.0:
+        # Fallback: usa agregados na ordem (nunca mistura)
         if "taxas_b3" in aggregates:
             components["taxas_b3_subst"] = aggregates["taxas_b3"]; used_aggregate = True
         elif "total_bovespa_soma" in aggregates:
@@ -367,6 +386,7 @@ def parse_cost_components(text: str) -> dict:
     components["_aggregates_found"] = list(aggregates.keys())
     components["_used_aggregate_substitute"] = used_aggregate
     components["_irrf_detected"] = irrf
+    components["_atomic_included_keys"] = atomic_included_keys  # debug
     return components
 
 def allocate_costs_proportional(amounts: pd.Series, total_costs: float) -> pd.Series:
@@ -539,6 +559,7 @@ st.markdown('<div class="subtitle">Extraia, agregue e rateie custos por ativo (p
 
 with st.sidebar:
     st.header("Opções")
+    incluir_transf_ativos = st.checkbox("Incluir 'Transf. de Ativos' no rateio (normalmente NÃO)", value=False)
     mostrar_cotacoes = st.checkbox("Mostrar cotações (yfinance)", value=True)
     st.markdown("---")
     st.subheader("Mapeamento opcional Nome→Ticker")
@@ -608,9 +629,13 @@ agg = (
 
 # Custos padronizados B3/XP
 fees = parse_cost_components(text)
-atomic_keys = ["liquidacao", "emolumentos", "registro", "corretagem", "taxa_operacional", "iss", "impostos", "outros"]
+atomic_keys = ["liquidacao", "emolumentos", "corretagem", "taxa_operacional", "iss", "impostos", "outros"]
 atomics_sum = sum(fees.get(k, 0.0) for k in atomic_keys)
 total_costs_detected = round(atomics_sum if atomics_sum > 0 else sum(v for k, v in fees.items() if k.endswith("_subst")), 2)
+
+# (Opcional) incluir "Transf. de Ativos" no rateio, se usuário quiser
+if incluir_transf_ativos:
+    total_costs_detected = round(total_costs_detected + fees.get("transf_ativos_excl", 0.0), 2)
 
 # Campo para confirmar/ajustar total de custos a ratear
 st.subheader("Custos a ratear")
@@ -712,4 +737,5 @@ with st.expander("🛠️ Debug (mostrar/ocultar)"):
     st.text_area("Texto extraído (parcial)", value=text[:4000], height=240)
     st.write("Extractor usado:", _extractor_used)
     st.write("Layout detectado:", layout)
+    st.write("Fees detectados:", parse_cost_components(text))
     st.write("Agregado numérico:", out)
