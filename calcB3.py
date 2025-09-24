@@ -1,6 +1,6 @@
 # calcB3.py
 # Streamlit app to parse B3/XP (Nota de Corretagem) PDFs, aggregate trades, allocate costs (by value),
-# compute average price, and show quotes with timestamps.
+# compute average price, and show quotes with timestamps (intraday with nightly fallback).
 # Usage: streamlit run calcB3.py
 
 import io
@@ -13,18 +13,22 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-# Optional deps: pdfplumber (preferred), PyPDF2 (fallback), yfinance (quotes)
+# Optional deps: pdfplumber (preferred), PyMuPDF (strong fallback), PyPDF2 (last), yfinance (quotes)
 try:
     import pdfplumber
 except Exception:
     pdfplumber = None
 
 try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+
+try:
     import PyPDF2
 except Exception:
     PyPDF2 = None
 
-# yfinance for quotes
 try:
     import yfinance as yf
 except Exception:
@@ -41,7 +45,6 @@ UTC = timezone.utc
 def strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
-
 def brl(v: float) -> str:
     """Format number as Brazilian currency-like string without R$ prefix."""
     if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
@@ -49,55 +52,108 @@ def brl(v: float) -> str:
     s = f"{v:,.2f}"
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
 
-
 def parse_brl_number(s: str) -> float:
-    """Parse a string like '1.234,56' into float 1234.56."""
+    """Parse '1.234,56' -> 1234.56."""
     return float(s.replace(".", "").replace(",", "."))
 
-
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract text from a PDF file using pdfplumber (preferred) or PyPDF2."""
-    text = ""
+def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
+    """Extract text using multiple strategies. Returns (text, extractor_name)."""
+    # 1) pdfplumber strict
     if pdfplumber is not None:
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                text = ""
                 for page in pdf.pages:
-                    # Tight tolerances preserve column order better for B3 notes
                     page_text = page.extract_text(x_tolerance=1, y_tolerance=1) or ""
                     text += page_text + "\n"
+                if text.strip():
+                    return text, "pdfplumber (strict tol=1/1)"
         except Exception:
-            text = ""
-    if not text and PyPDF2 is not None:
+            pass
+        # 1b) pdfplumber default
+        try:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                text = ""
+                for page in pdf.pages:
+                    text += (page.extract_text() or "") + "\n"
+                if text.strip():
+                    return text, "pdfplumber (default tol)"
+        except Exception:
+            pass
+        # 1c) pdfplumber word reconstruction
+        try:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                chunks = []
+                for page in pdf.pages:
+                    words = page.extract_words(use_text_flow=True) or []
+                    if words:
+                        words_sorted = sorted(words, key=lambda w: (round(w.get("top", 0), 1), w.get("x0", 0)))
+                        line_y = None
+                        line_words = []
+                        for w in words_sorted:
+                            y = round(w.get("top", 0), 1)
+                            txt = w.get("text", "")
+                            if line_y is None:
+                                line_y = y
+                            if abs(y - line_y) > 0.8:
+                                chunks.append(" ".join(line_words))
+                                line_words = [txt]
+                                line_y = y
+                            else:
+                                line_words.append(txt)
+                        if line_words:
+                            chunks.append(" ".join(line_words))
+                text = "\n".join(chunks)
+                if text.strip():
+                    return text, "pdfplumber (reconstructed words)"
+        except Exception:
+            pass
+
+    # 2) PyMuPDF
+    if fitz is not None:
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            pieces = [page.get_text("text") for page in doc]
+            text = "\n".join(pieces)
+            if text.strip():
+                return text, "PyMuPDF (fitz)"
+        except Exception:
+            pass
+
+    # 3) PyPDF2
+    if PyPDF2 is not None:
         try:
             reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+            if getattr(reader, "is_encrypted", False):
+                try:
+                    reader.decrypt("")
+                except Exception:
+                    pass
+            text = ""
             for page in reader.pages:
                 text += (page.extract_text() or "") + "\n"
+            if text.strip():
+                return text, "PyPDF2"
         except Exception:
-            text = ""
-    return text
+            pass
 
+    return "", "none"
 
 def detect_provider(text: str) -> str:
-    """Very simple provider detection: 'xp' if XP keywords found; otherwise 'b3'."""
+    """Return 'xp' if XP keywords found; else 'b3'."""
     t = strip_accents(text).lower()
-    if "xp investimentos" in t or "xp inc" in t or "xp cctvm" in t or "xp investimentos cctvm" in t:
+    if ("xp investimentos" in t) or ("xp inc" in t) or ("xp cctvm" in t) or ("xp investimentos cctvm" in t):
         return "xp"
     return "b3"
 
-
 def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
-    """
-    Parse trade lines from B3 'Negócios realizados' section.
-    Expected lines resemble:
-      '1-BOVESPA V VISTA EVEN          ON NM @ 300 7,76 2.328,00 C'
-      '1-BOVESPA C VISTA PETRORECSA          ON NM @ 200 13,27 2.654,00 D'
-    """
+    """Parse B3 'Negócios realizados' lines."""
     lines = text.splitlines()
     trade_lines = [l for l in lines if ("BOVESPA" in l and "VISTA" in l and "@" in l)]
     pattern = re.compile(
-        r"BOVESPA\s+(?P<cv>[CV])\s+VISTA\s+(?P<paper>[A-Z0-9ÇÃÕÉÊÍÓÚA-Z ]+?)\s+.*?@\s+(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<dc>[CD])"
+        r"BOVESPA\s+(?P<cv>[CV])\s+VISTA\s+(?P<paper>[A-Z0-9ÇÃÕÉÊÍÓÚA-Z ]+?)\s+.*?@\s+"
+        r"(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<dc>[CD])"
     )
-
     records = []
     for line in trade_lines:
         m = pattern.search(line)
@@ -109,30 +165,24 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
         price = parse_brl_number(m.group("price"))
         value = parse_brl_number(m.group("value"))
         dc = m.group("dc")
-
         ticker = name_to_ticker_map.get(paper_name, paper_name)
-
-        records.append(
-            {
-                "Ativo": ticker,
-                "Nome": paper_name,
-                "Operação": "Compra" if cv == "C" else "Venda",
-                "Quantidade": qty,
-                "Preço_Unitário": price,
-                "Valor": value if cv == "C" else -value,  # vendas negativas
-                "Sinal_DC": dc,
-            }
-        )
+        records.append({
+            "Ativo": ticker,
+            "Nome": paper_name,
+            "Operação": "Compra" if cv == "C" else "Venda",
+            "Quantidade": qty,
+            "Preço_Unitário": price,
+            "Valor": value if cv == "C" else -value,
+            "Sinal_DC": dc,
+        })
     return pd.DataFrame(records)
 
-
 def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
-    """
-    Fallback very generic parser: look for lines that resemble '<NAME> ... @ <QTY> <PRICE> <VALUE>' even if "BOVESPA/VISTA" not present.
-    """
+    """Generic fallback parser for lines like '<NAME> ... @ <QTY> <PRICE> <VALUE>'."""
     lines = [l for l in text.splitlines() if "@" in l and re.search(r"\d{1,3}(?:\.\d{3})*,\d{2}", l)]
     pattern = re.compile(
-        r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?(?P<paper>[A-Z0-9ÇÃÕÉÊÍÓÚA-Z ]{3,})\s+.*?@\s+(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})"
+        r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?(?P<paper>[A-Z0-9ÇÃÕÉÊÍÓÚA-Z ]{3,})\s+.*?@\s+"
+        r"(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})"
     )
     records = []
     for line in lines:
@@ -146,28 +196,22 @@ def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFr
         price = parse_brl_number(m.group("price"))
         value = parse_brl_number(m.group("value"))
         ticker = name_to_ticker_map.get(paper_name, paper_name)
-
-        records.append(
-            {
-                "Ativo": ticker,
-                "Nome": paper_name,
-                "Operação": "Compra" if cv == "C" else "Venda",
-                "Quantidade": qty,
-                "Preço_Unitário": price,
-                "Valor": value if cv == "C" else -value,
-                "Sinal_DC": "",
-            }
-        )
+        records.append({
+            "Ativo": ticker,
+            "Nome": paper_name,
+            "Operação": "Compra" if cv == "C" else "Venda",
+            "Quantidade": qty,
+            "Preço_Unitário": price,
+            "Valor": value if cv == "C" else -value,
+            "Sinal_DC": "",
+        })
     return pd.DataFrame(records)
 
-
 def parse_trades_any(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
-    """Try B3-style first; if empty, try generic fallback (useful for some XP layouts)."""
     df = parse_trades_b3style(text, name_to_ticker_map)
     if df.empty:
         df = parse_trades_generic_table(text, name_to_ticker_map)
     return df
-
 
 def parse_header_dates_and_net(text: str):
     """Extract 'Data do pregão' and 'Líquido para <data> <valor>' robustly (B3/XP)."""
@@ -215,15 +259,8 @@ def parse_header_dates_and_net(text: str):
 
     return data_pregao, liquido_para_data, liquido_para_valor
 
-
 def parse_cost_components(text: str) -> dict:
-    """
-    Canonicalize cost components across B3 and XP.
-    Returns a dict with atomic components (no aggregates), plus metadata keys:
-      - _aggregates_found: list of aggregate labels found (not counted unless needed)
-      - _used_aggregate_substitute: True if we had to use an aggregate (e.g., 'Taxas B3') due to missing atomics.
-      - _irrf_detected: numeric IRRF for info (never included in rateio)
-    """
+    """Canonicalize cost components (B3/XP) and avoid double counting."""
     pats = {
         "liquidacao": r"Taxa\s*de\s*liquida[cç][aã]o\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "emolumentos": r"Emolumentos\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
@@ -259,29 +296,23 @@ def parse_cost_components(text: str) -> dict:
 
     atomic_total = sum(components.values()) if components else 0.0
     used_aggregate = False
-
     if atomic_total == 0.0:
         if "taxas_b3" in aggregates:
-            components["taxas_b3_subst"] = aggregates["taxas_b3"]
-            used_aggregate = True
+            components["taxas_b3_subst"] = aggregates["taxas_b3"]; used_aggregate = True
         elif "total_bovespa_soma" in aggregates:
-            components["total_bovespa_soma_subst"] = aggregates["total_bovespa_soma"]
-            used_aggregate = True
+            components["total_bovespa_soma_subst"] = aggregates["total_bovespa_soma"]; used_aggregate = True
         elif "total_custos_despesas" in aggregates:
-            components["custos_despesas_subst"] = aggregates["total_custos_despesas"]
-            used_aggregate = True
+            components["custos_despesas_subst"] = aggregates["total_custos_despesas"]; used_aggregate = True
 
     components["_aggregates_found"] = list(aggregates.keys())
     components["_used_aggregate_substitute"] = used_aggregate
     components["_irrf_detected"] = irrf
     return components
 
-
 def allocate_costs_proportional(amounts: pd.Series, total_costs: float) -> pd.Series:
-    """Allocate total_costs across 'amounts' proportionally (by value), with rounding fix to match exactly."""
+    """Allocate total_costs across 'amounts' proportionally (by value), rounding to match exactly."""
     if amounts.sum() <= 0 or total_costs <= 0:
         return pd.Series([0.0] * len(amounts), index=amounts.index, dtype=float)
-
     raw = amounts / amounts.sum() * total_costs
     floored = (raw * 100).apply(math.floor) / 100.0
     residual = round(total_costs - floored.sum(), 2)
@@ -296,14 +327,12 @@ def allocate_costs_proportional(amounts: pd.Series, total_costs: float) -> pd.Se
             i += 1
     return floored
 
-
 def guess_yf_symbols_for_b3(ticker: str) -> list:
     """Return likely Yahoo symbols for a B3 ticker ('.SA' suffix)."""
     if not ticker:
         return []
     t = ticker.strip().upper()
     return [f"{t}.SA", t]
-
 
 def _format_dt_local(dt) -> str:
     if dt is None or pd.isna(dt):
@@ -322,68 +351,86 @@ def _format_dt_local(dt) -> str:
         except Exception:
             return str(dt)
 
-
 @st.cache_data(show_spinner=False, ttl=60)
 def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) -> pd.DataFrame:
-    """Intraday + fechamento do pregão."""
+    """
+    Busca intraday (1m→5m→15m); se vazio (noite/feriado), usa fechamento e marca '(fechamento)'.
+    Preenche também 'Fechamento (pregão)' e 'Pregão (data)'.
+    """
     cols = ["Ticker", "Símbolo", "Último", "Último (quando)", "Fechamento (pregão)", "Pregão (data)"]
     out_rows = []
-
     if yf is None or not tickers:
         return pd.DataFrame(columns=cols)
-
-    now_tz = datetime.now(TZ)
-    if ref_date is None:
-        start_daily = (now_tz - timedelta(days=10)).strftime("%Y-%m-%d")
-        end_daily = (now_tz + timedelta(days=1)).strftime("%Y-%m-%d")
-    else:
-        start_daily = (ref_date - timedelta(days=7)).strftime("%Y-%m-%d")
-        end_daily = (ref_date + timedelta(days=7)).strftime("%Y-%m-%d")
 
     for t in tickers:
         sym = guess_yf_symbols_for_b3(t)[0]
         last_px = None
         last_dt = None
+        last_from_close = False
         close_px = None
         close_dt = None
 
-        try:
-            h1m = yf.Ticker(sym).history(period="2d", interval="1m", auto_adjust=False)
-            if not h1m.empty and "Close" in h1m:
-                series = h1m["Close"].dropna()
-                if not series.empty:
-                    last_px = float(series.iloc[-1])
-                    idx = series.index[-1]
-                    if getattr(idx, "tzinfo", None) is None:
-                        idx = pd.Timestamp(idx).tz_localize(UTC)
-                    last_dt = idx.tz_convert(TZ)
-        except Exception:
-            pass
+        # 1) Intraday fallback chain
+        for intr in ["1m", "5m", "15m"]:
+            try:
+                h = yf.Ticker(sym).history(period="5d", interval=intr, auto_adjust=False)
+                if not h.empty and "Close" in h:
+                    s = h["Close"].dropna()
+                    if not s.empty:
+                        last_px = float(s.iloc[-1])
+                        idx = s.index[-1]
+                        if getattr(idx, "tzinfo", None) is None:
+                            idx = pd.Timestamp(idx).tz_localize(timezone.utc)
+                        last_dt = idx.tz_convert(TZ)
+                        break
+            except Exception:
+                pass
 
+        # 2) Daily close
         try:
-            hd = yf.Ticker(sym).history(start=start_daily, end=end_daily, auto_adjust=False)
-            if not hd.empty and "Close" in hd:
-                s = hd["Close"].dropna()
-                if not s.empty:
-                    if ref_date is None:
-                        close_px = float(s.iloc[-1]); idx = s.index[-1]
-                    else:
+            if ref_date is None:
+                hd = yf.Ticker(sym).history(period="10d", interval="1d", auto_adjust=False)
+                if not hd.empty and "Close" in hd:
+                    s = hd["Close"].dropna()
+                    if not s.empty:
+                        close_px = float(s.iloc[-1])
+                        idx = s.index[-1]
+                        if getattr(idx, "tzinfo", None) is None:
+                            idx = pd.Timestamp(idx).tz_localize(timezone.utc)
+                        close_dt = idx.tz_convert(TZ)
+            else:
+                start_daily = (ref_date - timedelta(days=7)).strftime("%Y-%m-%d")
+                end_daily = (ref_date + timedelta(days=7)).strftime("%Y-%m-%d")
+                hd = yf.Ticker(sym).history(start=start_daily, end=end_daily, auto_adjust=False)
+                if not hd.empty and "Close" in hd:
+                    s = hd["Close"].dropna()
+                    if not s.empty:
                         idxs = s.index[s.index.date <= ref_date.date()]
                         if len(idxs) > 0:
                             close_px = float(s.loc[idxs[-1]]); idx = idxs[-1]
                         else:
-                            idx = s.index[-1]; close_px = float(s.iloc[-1])
-                    if getattr(idx, "tzinfo", None) is None:
-                        idx = pd.Timestamp(idx).tz_localize(UTC)
-                    close_dt = idx.tz_convert(TZ)
+                            close_px = float(s.iloc[-1]); idx = s.index[-1]
+                        if getattr(idx, "tzinfo", None) is None:
+                            idx = pd.Timestamp(idx).tz_localize(timezone.utc)
+                        close_dt = idx.tz_convert(TZ)
         except Exception:
             pass
+
+        # 3) Use fechamento como 'Último' se intraday falhou
+        if last_px is None and close_px is not None:
+            last_px = close_px
+            last_dt = close_dt
+            last_from_close = True
+
+        when_str = _format_dt_local(last_dt)
+        if last_from_close and when_str:
+            when_str += " (fechamento)"
 
         out_rows.append({
             "Ticker": t,
             "Símbolo": sym,
             "Último": last_px,
-            "Último (quando)": _format_dt_local(last_dt),
+            "Último (quando)": when_str,
             "Fechamento (pregão)": close_px,
             "Pregão (data)": close_dt.date().strftime("%d/%m/%Y") if close_dt else "",
         })
@@ -423,7 +470,7 @@ with st.sidebar:
     st.write("Se sua nota usa **nome da empresa** (ex.: VULCABRAS) ao invés do ticker (VULC3), forneça um CSV `Nome,Ticker`.")
     map_file = st.file_uploader("Upload CSV de mapeamento (opcional)", type=["csv"], key="map_csv")
 
-# Mapeamento inicial (exemplos desta conversa)
+# Mapeamento inicial (exemplos)
 default_map = {"EVEN": "EVEN3", "PETRORECSA": "RECV3", "VULCABRAS": "VULC3"}
 
 # Carregar mapeamento adicional
@@ -444,12 +491,12 @@ if uploaded is None:
 
 # Parse PDF text
 pdf_bytes = uploaded.read()
-text = extract_text_from_pdf(pdf_bytes)
+text, _extractor_used = extract_text_from_pdf(pdf_bytes)
 if not text:
     st.error("Não consegui extrair texto do PDF. Tente enviar um PDF com texto (não imagem) ou exporte novamente.")
     st.stop()
 
-# Detect provider and show badge (AGORA sim, depois do text)
+# Provider + badge
 provider = detect_provider(text)
 _badge_cls = "badge-xp" if provider == "xp" else "badge-b3"
 _badge_label = provider.upper()
@@ -514,7 +561,7 @@ total_costs_input = st.number_input(
     help="Soma das taxas que deseja distribuir entre os ativos. Ajuste se necessário para casar com seus 'Custos' esperados."
 )
 
-# Alocar custos proporcionalmente por (Ativo, Operação)
+# Rateio por (Ativo, Operação)
 alloc_series = allocate_costs_proportional(agg.set_index(["Ativo", "Operação"])["BaseRateio"], total_costs_input)
 alloc_df = alloc_series.reset_index()
 alloc_df.columns = ["Ativo", "Operação", "Custos"]
@@ -579,7 +626,7 @@ if mostrar_cotacoes:
             quotes = fetch_quotes_for_tickers(tickers, ref_date=ref_date)
             if not quotes.empty:
                 now_local = datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
-                st.caption(f"Agora (BRT): {now_local} • Fonte: Yahoo Finance (intraday 1m)")
+                st.caption(f"Agora (BRT): {now_local} • Fonte: Yahoo Finance")
                 qfmt = quotes.copy()
                 for c in ["Último", "Fechamento (pregão)"]:
                     qfmt[c] = qfmt[c].map(lambda x: brl(x) if pd.notna(x) else "")
@@ -591,6 +638,7 @@ if mostrar_cotacoes:
 # ===== Debug (Expander) =====
 with st.expander("🛠️ Debug (mostrar/ocultar)"):
     st.text_area("Texto extraído (parcial)", value=text[:4000], height=200)
+    st.write("Extractor usado:", _extractor_used)
     st.write("Provedor detectado:", provider)
     st.write("Fees detectados:", fees)
     st.write("Agregado numérico:", out)
