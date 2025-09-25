@@ -807,10 +807,10 @@ def style_portfolio_df(df: pd.DataFrame) -> Any:
         "Total": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
         "Patrimônio": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
     })
-    # centralizar tudo
+    # centralizar tudo (sem negrito/fundo)
     sty = sty.set_properties(**{"text-align":"center"})
     sty = sty.set_table_styles([{"selector":"th","props":[("text-align","center")]}], overwrite=False)
-    # destaque nas colunas Quantidade / Total
+    # leve destaque apenas com borda
     cols_emphasis = [c for c in ["Quantidade","Total"] if c in df.columns]
     if cols_emphasis:
         sty = sty.set_properties(
@@ -969,6 +969,9 @@ with colfR:
     data_ate = st.date_input("Data de corte (até)", value=datetime.now(TZ).date())
 data_ate_str = datetime.strftime(datetime.combine(data_ate, datetime.min.time()), "%d/%m/%Y")
 
+# "salt" para invalidar cache das cotações a cada 30s (sincroniza com auto-refresh)
+salt = int(_now() // 30)
+
 # Ativos (posição + cotação + total líquido + patrimônio) + linha TOTAL
 df_pos = db_positions_dataframe(as_of=data_ate_str, filtro_ativo=filtro_txt)
 df_tot = db_rollup_net_total_by_ticker(as_of=data_ate_str, filtro_ativo=filtro_txt)  # TOTAL descontando venda
@@ -976,14 +979,13 @@ df_master = pd.merge(df_pos, df_tot, on="Ativo", how="outer").fillna({"Quantidad
 df_master = df_master.sort_values("Ativo")
 
 tickers_all = clean_b3_tickers(df_master["Ativo"].tolist())
-# usa 'salt' p/ variar cache quando auto-refresh estiver ativo
 quotes_df = fetch_quotes_yahoo_for_tickers(tickers_all, _salt=int(salt)) if tickers_all else pd.DataFrame()
 last_map = {r["Ticker"]: r["Último"] for _, r in quotes_df.iterrows()} if not quotes_df.empty else {}
 
 df_master["Cotação"] = df_master["Ativo"].map(last_map)
 df_master["Patrimônio"] = df_master.apply(lambda r: (r["Quantidade"] * r["Cotação"]) if (pd.notna(r["Cotação"]) and r["Quantidade"]>0) else 0.0, axis=1)
 
-# Linha TOTAL (Total líquido e Patrimônio)
+# Linha TOTAL (Total líquido e Patrimônio) — não somar "Total"
 total_row = {
     "Ativo":"TOTAL",
     "Quantidade": df_master["Quantidade"].sum(skipna=True),
@@ -1014,7 +1016,6 @@ if hasattr(st, "popover") and tickers_choices:
                 if df_mov.empty:
                     st.info("Sem movimentações para este ticker no período.")
                 else:
-                    # mantém PM nas vendas; colunas centralizadas via render_table()
                     render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
         i += 1
 else:
