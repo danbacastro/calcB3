@@ -1006,8 +1006,6 @@ st.dataframe(
         "Patrimônio": st.column_config.NumberColumn(format="R$ %.2f"),
     }
 )
-st.caption("Patrimônio = Quantidade × Cotação (0 quando posição zerada). Linha TOTAL soma Custos e Patrimônio.")
-st.markdown('</div>', unsafe_allow_html=True)
 
 # Movimentações do ticker (abaixo da tabela)
 choices = sorted([t for t in df_master["Ativo"].dropna().astype(str).unique().tolist() if t != "TOTAL"])
