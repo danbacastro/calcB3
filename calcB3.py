@@ -810,7 +810,7 @@ def style_portfolio_df(df: pd.DataFrame) -> Any:
     if cols_emphasis:
         sty = sty.set_properties(
             subset=cols_emphasis,
-            **{"border-left":"1px solid #e5e7eb","border-right":"1px solid #e5e7eb","font-weight":"700"}
+            **{"border-left":"1px solid #e5e7eb","border-right":"1px solid #e5e7eb"}
         )
     sty = sty.set_properties(**{"border":"1px solid #e5e7eb"})
     return sty
