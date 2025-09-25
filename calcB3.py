@@ -11,6 +11,7 @@ import unicodedata
 import hashlib
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -702,7 +703,7 @@ def process_one_pdf(pdf_bytes: bytes, map_dict: dict):
 # UI helpers
 # =============================================================================
 
-def style_result_df(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+def style_result_df(df: pd.DataFrame) -> Any:
     """Aplica destaque nas colunas pedidas (borda preta, negrito e fundo)."""
     cols_emphasis = ["Data do Pregão", "Quantidade", "Valor", "Total"]
     existing = [c for c in cols_emphasis if c in df.columns]
@@ -713,7 +714,6 @@ def style_result_df(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         "Custos": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
         "Total": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
     })
-    # borda + fundo + negrito nas colunas destacadas
     styles = []
     for c in existing:
         styles.append(dict(selector=f'th.col_heading.level0:nth-child({df.columns.get_loc(c)+1})',
@@ -721,7 +721,6 @@ def style_result_df(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         styles.append(dict(selector=f'td.col{df.columns.get_loc(c)}',
                            props=[('border','2px solid #000'), ('font-weight','700'), ('background-color','#f6f7f9')]))
     sty = sty.set_table_styles(styles, overwrite=False)
-    # borda geral suave
     sty = sty.set_properties(**{"border": "1px solid #e5e7eb"})
     return sty
 
