@@ -1,9 +1,18 @@
-streamlit>=1.37,<2
-pandas>=2.2.2,<3
-numpy>=1.26
-pdfplumber>=0.11.4
-PyMuPDF>=1.24.10
-PyPDF2>=3.0.1
-yfinance>=0.2.43
-requests>=2.32.3
-tzdata>=2024.1
+# Core
+streamlit>=1.33
+pandas>=2.2
+numpy
+
+# Quotes
+yfinance>=0.2.40
+lxml>=4.9
+requests
+
+# PDF parsing
+pdfplumber>=0.10
+PyMuPDF>=1.24
+PyPDF2>=3.0
+
+# Extras
+streamlit-autorefresh>=1.0.1
+tzdata
