@@ -1004,33 +1004,85 @@ st.caption("• Total = compras − vendas (líquido).  • Patrimônio = Quanti
 st.markdown('</div>', unsafe_allow_html=True)
 
 # Movimentações via POP-UP ao clicar no ticker (se disponível)
-tickers_choices = sorted([t for t in df_master["Ativo"].dropna().astype(str).unique().tolist()])
-if hasattr(st, "popover") and tickers_choices:
-    st.markdown("#### 🔔 Clique no ticker para ver as movimentações")
-    cols = st.columns(6)
-    i = 0
-    for t in tickers_choices:
-        with cols[i % 6]:
-            with st.popover(t):
-                df_mov = db_movements_for_ticker(t, as_of=data_ate_str)
-                if df_mov.empty:
-                    st.info("Sem movimentações para este ticker no período.")
-                else:
-                    render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
-        i += 1
+# Linha TOTAL (Total líquido e Patrimônio) — não somar "Total"
+total_row = {
+    "Ativo":"TOTAL",
+    "Quantidade": df_master["Quantidade"].sum(skipna=True),
+    "PM": None,
+    "Custo Atual": df_master["Custo Atual"].sum(skipna=True),
+    "Total": None,
+    "Cotação": None,
+    "Patrimônio": df_master["Patrimônio"].sum(skipna=True),
+}
+df_master_tot = pd.concat([df_master, pd.DataFrame([total_row])], ignore_index=True)
+
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.markdown("#### Ativos")
+
+# ====== TABELA CLICÁVEL (AgGrid) ======
+if AgGrid is not None:
+    grid_df = df_master_tot[["Ativo","Quantidade","PM","Cotação","Total","Patrimônio"]].copy()
+
+    gob = GridOptionsBuilder.from_dataframe(grid_df)
+    gob.configure_selection(selection_mode="single", use_checkbox=False)
+    gob.configure_grid_options(suppressRowClickSelection=False)
+    gob.configure_default_column(cellStyle={"textAlign":"center"})
+    # Centraliza cabeçalho também
+    gob.configure_grid_options(headerHeight=36)
+    grid_options = gob.build()
+
+    grid_resp = AgGrid(
+        grid_df,
+        gridOptions=grid_options,
+        update_mode=GridUpdateMode.SELECTION_CHANGED,
+        allow_unsafe_jscode=True,
+        theme="balham",
+        fit_columns_on_grid_load=True,
+        height=360,
+    )
+
+    # Quando o usuário clica numa linha, abrimos o modal com as movimentações
+    sel = grid_resp.get("selected_rows", [])
+    if sel:
+        picked = sel[0].get("Ativo")
+        if picked and picked != "TOTAL":
+            st.session_state["modal_ticker"] = picked
+            st.session_state["show_modal"] = True
+
+    # Modal (pop-up) com as movimentações
+    modal_ticker = st.session_state.get("modal_ticker")
+    show_modal  = st.session_state.get("show_modal", False)
+
+    if modal_ticker and show_modal and hasattr(st, "modal"):
+        with st.modal(f"Movimentações — {modal_ticker}", key="movs_modal"):
+            df_mov = db_movements_for_ticker(modal_ticker, as_of=data_ate_str)
+            if df_mov.empty:
+                st.info("Sem movimentações para este ticker no período.")
+            else:
+                render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+            colm1, colm2 = st.columns([1,3])
+            with colm1:
+                if st.button("Fechar"):
+                    st.session_state["show_modal"] = False
+                    st.rerun()
+    elif sel:
+        # Fallback quando não há st.modal disponível: card abaixo
+        picked = sel[0].get("Ativo")
+        if picked and picked != "TOTAL":
+            st.markdown("---")
+            st.markdown(f"#### Movimentações — {picked}")
+            df_mov = db_movements_for_ticker(picked, as_of=data_ate_str)
+            if df_mov.empty:
+                st.info("Sem movimentações para este ticker no período.")
+            else:
+                render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+
 else:
-    # Fallback (versões de Streamlit sem popover)
-    choices = [t for t in tickers_choices if t != "TOTAL"]
-    pick = st.selectbox("🔎 Escolha o ativo para ver as movimentações", choices, index=0 if choices else None)
-    if pick:
-        df_mov = db_movements_for_ticker(pick, as_of=data_ate_str)
-        if df_mov.empty:
-            st.info("Sem movimentações para este ticker no período.")
-        else:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown(f"#### Movimentações – {pick}")
-            render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
-            st.markdown('</div>', unsafe_allow_html=True)
+    # Fallback total (sem AgGrid): só renderiza a tabela estática
+    render_portfolio(df_master_tot[["Ativo","Quantidade","PM","Cotação","Total","Patrimônio"]])
+    st.caption("• Clique nas 'chips' acima (ou use o seletor) para ver movimentações.")
+st.caption("• Total = compras − vendas (líquido).  • Patrimônio = Quantidade × Cotação (0 quando posição zerada).")
+st.markdown('</div>', unsafe_allow_html=True)
 
 # ================================ Gerenciar banco ============================
 st.markdown("### ⚙️ Gerenciar carteira")
