@@ -870,7 +870,7 @@ if uploads:
         results.append(res)
 
 # ================================ Consolidado =================================
-st.markdown("## 📚 Consolidado (dos PDFs carregados agora)")
+st.markdown("## 📚 Consolidado")
 if not results:
     st.info("Envie um ou mais arquivos PDF para ver o consolidado.")
 else:
@@ -882,11 +882,11 @@ else:
         # Filtros rápidos: Compra/Venda, FIIs x Ações
         colf1, colf2, colf3 = st.columns([1,1,2])
         with colf1:
-            fil_compra = st.checkbox("Mostrar Compras", True)
-            fil_venda  = st.checkbox("Mostrar Vendas", True)
+            fil_compra = st.checkbox("Somente Compras", True)
+            fil_venda  = st.checkbox("Somente Vendas", True)
         with colf2:
-            apenas_fiis   = st.checkbox("Só FIIs (..11)", False)
-            apenas_acoes  = st.checkbox("Só Ações (..3/4/5/6)", False)
+            apenas_fiis   = st.checkbox("Somente FIIs", False)
+            apenas_acoes  = st.checkbox("Somente Ações", False)
         with colf3:
             filtro_ticker = st.text_input("Filtro por ticker (contém)", "")
 
@@ -907,12 +907,12 @@ else:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         render_result_table(dfc[["Data do Pregão","Ativo","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
         csv_cons = dfc.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("Baixar CSV (consolidado atual)", data=csv_cons, file_name="resultado_consolidado.csv", mime="text/csv")
+        st.download_button("Baixar consolidado", data=csv_cons, file_name="resultado_consolidado.csv", mime="text/csv")
         st.markdown('</div>', unsafe_allow_html=True)
 
         # ➕ Adicionar ao banco (todas ou selecionar)
         st.markdown("#### ➕ Adicionar PDFs carregados ao banco")
-        allow_dups = st.checkbox("Permitir duplicados (por filehash)", value=False)
+        allow_dups = st.checkbox("Permitir redundância de notas", value=False)
         if st.button("➕ Adicionar todas as notas visíveis"):
             inserted = 0; duplicated = 0
             for r in results:
@@ -956,7 +956,7 @@ if results:
                         st.success("Salvo no banco.")
 
 # ================================ Banco / Carteira ============================
-st.markdown("## 📦 Banco / Carteira")
+st.markdown("## 📦 Carteira")
 
 # Filtros (DB)
 colfL, colfR = st.columns([2,2])
@@ -1024,7 +1024,7 @@ if pick:
         st.markdown('</div>', unsafe_allow_html=True)
 
 # Gerenciamento de ingestões: excluir/undo e edição manual
-st.markdown("### ⚙️ Gerenciar banco")
+st.markdown("### ⚙️ Gerenciar carteira")
 
 with st.expander("🗑️ Excluir/estornar uma ingestão (com undo)"):
     # lista simples de ingestions
