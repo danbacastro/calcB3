@@ -1036,7 +1036,7 @@ total_row = {
 df_master_tot = pd.concat([df_master, pd.DataFrame([total_row])], ignore_index=True)
 
 st.markdown('<div class="card">', unsafe_allow_html=True)
-st.markdown("#### Ativos (clique no ticker)")
+st.markdown("#### Ativos")
 render_portfolio_interactive(df_master_tot[["Ativo","Quantidade","PM","Cotação","Total","Patrimônio"]], as_of_str=data_ate_str)
 st.caption("• Total = compras − vendas (líquido).  • Patrimônio = Quantidade × Cotação (0 quando posição zerada).")
 st.markdown('</div>', unsafe_allow_html=True)
