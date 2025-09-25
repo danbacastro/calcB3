@@ -1,9 +1,10 @@
 # calcB3.py
 # Streamlit app para ler notas B3/XP (PDF), agregar negociações, ratear custos (pela base financeira),
-# calcular preço médio e exibir cotações.
-# Regra de custos a ratear:
-#   Total = Liquidação + Registro + Total Bovespa/Soma + Total Custos/Despesas
-# Se algum total não existir, reconstrói a parcela com componentes atômicos equivalentes.
+# calcular preço médio e exibir cotações (Google Finance ou Yahoo Finance).
+# Tickers:
+#   - FII: 4 letras + 11 (ex.: VCJR11)
+#   - Demais: letras + número (ex.: PETR4, AAPL34, BOVA11)
+# Se não houver ticker explícito, tenta heurística: LETRAS + (3 se ON | 4 se PN).
 # Uso: streamlit run calcB3.py
 
 import io
@@ -146,30 +147,70 @@ def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
 
     return "", "none"
 
-# --- ticker extraction (prioriza FII: ...11) ---
-def extract_b3_ticker(s: str) -> str | None:
-    """
-    Extrai um ticker brasileiro da string.
-    Preferência: FII (4-6 letras + '11' + opcional 1 letra), depois ações/BDRs.
-    Exemplos: VCJR11, HGLG11, PETR4, AAPL34, ABCDE11B
-    """
-    s = strip_accents(s).upper()
-    # 1) FII prioritário
-    m = re.search(r"\b([A-Z]{4,6}11[A-Z]?)\b", s)
-    if m:
-        return m.group(1)
-    # 2) Geral (ações/BDRs)
-    m = re.search(r"\b([A-Z]{4,5}\d{1,2}[A-Z]?)\b", s)
-    if m:
-        return m.group(1)
-    # 3) Fallback
-    m = re.search(r"\b([A-Z]{3,5}\d{1,2})\b", s)
-    if m:
-        return m.group(1)
+
+# ---------------------------
+# Tickers
+# ---------------------------
+
+# Regras:
+# - FII: 4 letras + 11 (+ opcional 1 letra)
+# - ETF/Unidades/Outros com 11: 3-6 letras + 11
+# - Ações "clássicas": 4 letras + [3|4|5|6] (+ opcional 1 letra)
+# - BDRs: 4 letras + 2 dígitos (ex.: 32, 34, 35, 36, 39...)
+FII_EXACT = re.compile(r"\b([A-Z]{4}11[A-Z]?)\b")
+WITH_11   = re.compile(r"\b([A-Z]{3,6}11[A-Z]?)\b")
+SHARES    = re.compile(r"\b([A-Z]{4}[3456][A-Z]?)\b")
+BDR_2D    = re.compile(r"\b([A-Z]{4}\d{2}[A-Z]?)\b")
+
+def extract_ticker_from_text(text: str) -> str | None:
+    """Procura ticker explícito no texto, priorizando FII 4L+11, depois 3-6L+11, ações 4L+[3-6], e BDR 4L+2D."""
+    t = strip_accents(text).upper()
+    for rx in (FII_EXACT, WITH_11, SHARES, BDR_2D):
+        m = rx.search(t)
+        if m:
+            return m.group(1)
     return None
 
+def derive_from_on_pn(text: str) -> str | None:
+    """
+    Heurística: se aparecer 'XXXX ON' → XXXX3; 'XXXX PN' → XXXX4.
+    Só aceita base com 3-6 letras (evita nomes longos tipo 'PETRORECSA').
+    """
+    t = strip_accents(text).upper()
+    # Padrão: <BASE 3-6 letras> + espaço + (ON|PN)
+    m = re.search(r"\b([A-Z]{3,6})\s+(ON|PN)\b", t)
+    if not m:
+        return None
+    base, cls = m.group(1), m.group(2)
+    if cls == "ON":
+        return f"{base}3"
+    if cls == "PN":
+        return f"{base}4"
+    return None
+
+def clean_b3_tickers(lst) -> list:
+    """Normaliza e filtra possíveis tickers (inclusive FIIs ...11)."""
+    out = []
+    for t in lst:
+        if not isinstance(t, str):
+            continue
+        t = strip_accents(t).upper().strip()
+        if not t:
+            continue
+        # Válido: tem dígitos no final (ações/BDR/ETF) ou ...11 (FII/ETF)
+        if re.fullmatch(r"[A-Z]{3,6}\d{1,2}[A-Z]?", t):
+            out.append(t)
+    return sorted(set(out))
+
+
+# ---------------------------
+# Parsers de negociações
+# ---------------------------
+
 def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
-    """Linhas do tipo '1-BOVESPA C VISTA ... @ QTY PRICE VALUE D/C' (inclui FIIs/BDRs)."""
+    """
+    Linhas do tipo: '1-BOVESPA C VISTA <ESPEC> @ QTY PRICE VALUE D/C'
+    """
     lines = text.splitlines()
     trade_lines = [l for l in lines if ("BOVESPA" in l and "VISTA" in l and "@" in l)]
     pattern = re.compile(
@@ -189,14 +230,25 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
         value = parse_brl_number(m.group("value"))
         dc = m.group("dc")
 
-        ticker = extract_b3_ticker(spec) or extract_b3_ticker(line)
-        paper_name = spec
+        # 1) Ticker explícito na espec/linha
+        ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
+
+        # 2) Mapa Nome→Ticker (nome curto em CAPS)
         if not ticker:
-            ticker = name_to_ticker_map.get(paper_name.upper(), paper_name.upper())
+            key = re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
+            ticker = name_to_ticker_map.get(key)
+
+        # 3) Heurística ON/PN
+        if not ticker:
+            ticker = derive_from_on_pn(spec)
+
+        # 4) Se ainda falhar, não usa 'nome SA' — deixa vazio (melhor do que ticker errado)
+        if not ticker:
+            ticker = ""
 
         recs.append({
             "Ativo": ticker,
-            "Nome": paper_name,
+            "Nome": spec,
             "Operação": "Compra" if cv == "C" else "Venda",
             "Quantidade": qty,
             "Preço_Unitário": price,
@@ -206,7 +258,9 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     return pd.DataFrame(recs)
 
 def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
-    """Fallback genérico: '<...> @ QTY PRICE VALUE' com ticker detectado na linha."""
+    """
+    Fallback genérico: '<...> @ QTY PRICE VALUE' com ticker detectado na linha.
+    """
     lines = [l for l in text.splitlines() if "@" in l and re.search(r"\d{1,3}(?:\.\d{3})*,\d{2}", l)]
     pattern = re.compile(
         r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?(?P<spec>.+?)@\s+"
@@ -224,14 +278,18 @@ def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFr
         price = parse_brl_number(m.group("price"))
         value = parse_brl_number(m.group("value"))
 
-        ticker = extract_b3_ticker(spec) or extract_b3_ticker(line)
-        paper_name = spec
+        ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
         if not ticker:
-            ticker = name_to_ticker_map.get(paper_name.upper(), paper_name.upper())
+            key = re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
+            ticker = name_to_ticker_map.get(key)
+        if not ticker:
+            ticker = derive_from_on_pn(spec)
+        if not ticker:
+            ticker = ""
 
         recs.append({
             "Ativo": ticker,
-            "Nome": paper_name,
+            "Nome": spec,
             "Operação": "Compra" if cv == "C" else "Venda",
             "Quantidade": qty,
             "Preço_Unitário": price,
@@ -246,34 +304,27 @@ def parse_trades_any(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
         df = parse_trades_generic_table(text, name_to_ticker_map)
     return df
 
+
+# ---------------------------
+# Layout e cabeçalho
+# ---------------------------
+
 def detect_layout(text: str) -> str:
-    """Detecta o LAYOUT (B3 vs XP), não a corretora."""
+    """Detecta o LAYOUT (B3 vs XP)."""
     t = strip_accents(text).lower()
-
-    # Marcadores XP (comprovante/portal XP)
-    xp_hits = 0
-    for m in [
+    xp_hits = sum(k in t for k in [
         "data da consulta", "data de referencia", "conta xp", "codigo assessor",
-        "corretagem / despesas",
-        "atendimento ao cliente: +55 11 4003-3710", "ouvidoria: 0800 722 3730",
-        "xp investimentos cctvm", "https://www.xpi.com.br/"
-    ]:
-        if m in t: xp_hits += 1
-
-    # Marcadores B3 "clássico"
-    b3_hits = 0
-    for m in [
+        "corretagem / despesas", "atendimento ao cliente:", "ouvidoria:",
+        "xp investimentos cctvm", "xpi.com.br"
+    ])
+    b3_hits = sum(k in t for k in [
         "nota de negociacao", "resumo dos negocios", "total custos / despesas",
         "total bovespa / soma", "cblc", "liquido para", "clearing", "1-bovespa"
-    ]:
-        if m in t: b3_hits += 1
-
+    ])
     if xp_hits >= max(2, b3_hits + 1):
         return "XP"
     if b3_hits >= max(2, xp_hits + 1):
         return "B3"
-
-    # Desempate: se o parser B3-style encontra linhas, tende a ser layout B3
     try:
         if not parse_trades_b3style(text, {}).empty:
             return "B3"
@@ -288,13 +339,7 @@ def parse_header_dates_and_net(text: str):
     pairs = list(zip(lines, norms))
 
     data_pregao = None
-
-    # 1) Prioridade: rótulos explícitos (ignora 'consulta/referência')
-    label_pats = [
-        r"data\s*do\s*preg[aã]o",
-        r"data\s*da\s*negocia[cç][aã]o",
-        r"\bnegocia[cç][aã]o\b"
-    ]
+    label_pats = [r"data\s*do\s*preg[aã]o", r"data\s*da\s*negocia[cç][aã]o", r"\bnegocia[cç][aã]o\b"]
     for raw, norm in pairs[:200]:
         if any(re.search(p, norm) for p in label_pats):
             md = re.search(r"(\d{2}/\d{2}/\d{4})", raw)
@@ -302,7 +347,6 @@ def parse_header_dates_and_net(text: str):
                 data_pregao = md.group(1)
                 break
 
-    # 2) Fallback: primeira data no topo sem "consulta/referenc/liquido" e não-CNPJ
     if not data_pregao:
         for raw, norm in pairs[:120]:
             if ("consulta" in norm) or ("referenc" in norm) or ("liquido" in norm) or ("l\u00edquido" in norm):
@@ -314,7 +358,6 @@ def parse_header_dates_and_net(text: str):
                 data_pregao = md.group(1)
                 break
 
-    # 3) 'Líquido para' (data/valor) — varre de baixo pra cima
     liquido_para_data = None
     liquido_para_valor = None
     for raw, norm in pairs[::-1]:
@@ -335,13 +378,8 @@ def parse_header_dates_and_net(text: str):
 # ---------------------------
 
 def parse_cost_components(text: str) -> dict:
-    """
-    Extrai componentes/agrupados de custo (B3/XP) evitando dupla contagem.
-    Padroniza rótulos de totais (B3: "Total Custos / Despesas"; XP: "Total Corretagem / Despesas").
-    """
+    """Extrai componentes e totais (B3/XP) evitando dupla contagem."""
     components = {}
-
-    # Atomics
     atom_pats = {
         "liquidacao": r"Taxa\s*de\s*liquida[cç][aã]o\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "emolumentos": r"Emolumentos\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
@@ -358,7 +396,6 @@ def parse_cost_components(text: str) -> dict:
         if m:
             components[key] = parse_brl_number(m.group(1))
 
-    # Totais / agregados (padronizados)
     totals_pats = {
         "total_bovespa_soma": r"Total\s*Bovespa\s*/\s*Soma\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "total_custos_despesas": r"Total\s*(?:Custos|Corretagem)\s*/\s*Despesas\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
@@ -369,26 +406,20 @@ def parse_cost_components(text: str) -> dict:
         if m:
             components[key] = parse_brl_number(m.group(1))
 
-    # IRRF (para info; fora do rateio)
     m_irrf = re.search(r"I\.?R\.?R\.?F\.?.*?(\d{1,3}(?:\.\d{3})*,\d{2})", text, flags=re.IGNORECASE)
     if m_irrf:
         components["_irrf"] = parse_brl_number(m_irrf.group(1))
-
     return components
 
 def compute_rateable_total(fees: dict) -> tuple[float, dict]:
     """
-    TOTAL para rateio:
-      Liquidação + Registro + Total Bovespa/Soma + Total Custos/Despesas
+    TOTAL para rateio = Liquidação + Registro + Total Bovespa/Soma + Total Custos/Despesas.
     Se algum total não existir, reconstrói via atômicos equivalentes.
-    Retorna (total, detalhes_usados)
     """
     used = {}
-
     liq = fees.get("liquidacao", 0.0); used["liquidacao"] = liq
     reg = fees.get("registro", 0.0);   used["registro"] = reg
 
-    # Total Bovespa / Soma
     tb = fees.get("total_bovespa_soma")
     if tb is None:
         tb = (fees.get("emolumentos", 0.0) + fees.get("transf_ativos", 0.0))
@@ -396,12 +427,9 @@ def compute_rateable_total(fees: dict) -> tuple[float, dict]:
     else:
         used["total_bovespa_soma"] = tb
 
-    # Total Custos / Despesas
     tcd = fees.get("total_custos_despesas")
     if tcd is None:
-        base_cor = fees.get("corretagem", 0.0)
-        if base_cor == 0.0:
-            base_cor = fees.get("taxa_operacional", 0.0)
+        base_cor = fees.get("corretagem", 0.0) or fees.get("taxa_operacional", 0.0)
         tcd = base_cor + fees.get("iss", 0.0) + fees.get("impostos", 0.0) + fees.get("outros", 0.0)
         used["total_custos_despesas_reconstr"] = tcd
     else:
@@ -416,25 +444,8 @@ def compute_rateable_total(fees: dict) -> tuple[float, dict]:
 # Cotações (Google/Yahoo)
 # ---------------------------
 
-def clean_b3_tickers(lst) -> list:
-    """Normaliza e filtra possíveis tickers B3 (inclui FIIs ...11)."""
-    out = []
-    for t in lst:
-        if not isinstance(t, str):
-            continue
-        t = t.strip().upper()
-        if not t:
-            continue
-        # Padrões: FIIs ABCD11, ações PETR4, BDRs AAPL34, ETFs BOVA11, sufixo letra opcional
-        if re.fullmatch(r"[A-Z]{3,6}\d{0,2}[A-Z]?", t):
-            out.append(t)
-    return sorted(set(out))
-
 def guess_yf_symbols_for_b3(ticker: str) -> list:
-    if not ticker:
-        return []
-    t = ticker.strip().upper()
-    return [f"{t}.SA", t]
+    return [f"{ticker.upper()}.SA", ticker.upper()]
 
 def _format_dt_local(dt) -> str:
     if dt is None or pd.isna(dt):
@@ -457,9 +468,8 @@ def _pick_symbol_with_data(ticker: str) -> tuple[str|None, str]:
     """(Yahoo) Tenta '.SA' primeiro; cai para sem sufixo. Garante histórico diário."""
     if yf is None:
         return None, "yfinance ausente"
-    candidates = [f"{ticker.upper()}.SA", ticker.upper()]
     last_err = ""
-    for sym in candidates:
+    for sym in guess_yf_symbols_for_b3(ticker):
         try:
             hd = yf.Ticker(sym).history(period="10d", interval="1d", auto_adjust=False)
             if not hd.empty and "Close" in hd and not hd["Close"].dropna().empty:
@@ -552,7 +562,6 @@ def fetch_quotes_yahoo_for_tickers(tickers: list, ref_date: datetime | None = No
     return pd.DataFrame(rows, columns=cols)
 
 def _parse_price_any(txt: str) -> float | None:
-    """Converte 'R$ 1.234,56' ou '1,23'/'1.23' em float."""
     if not txt:
         return None
     s = re.sub(r"[^\d,\.]", "", txt)
@@ -569,20 +578,13 @@ def _parse_price_any(txt: str) -> float | None:
 
 @st.cache_data(show_spinner=False, ttl=60)
 def fetch_quotes_google_for_tickers(tickers: list) -> pd.DataFrame:
-    """
-    Faz scraping leve de https://www.google.com/finance/quote/<TICKER>:BVMF
-    Campos retornados: Último (com timestamp = agora BRT), Símbolo '<TICKER>:BVMF'.
-    """
     cols = ["Ticker", "Símbolo", "Último", "Último (quando)", "Fechamento (pregão)", "Pregão (data)", "Motivo"]
     rows = []
     if requests is None or not tickers:
         return pd.DataFrame(columns=cols)
 
     now_brt = datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
-    }
+    headers = { "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36" }
 
     for t in tickers:
         sym = f"{t}:BVMF"
@@ -593,7 +595,6 @@ def fetch_quotes_google_for_tickers(tickers: list) -> pd.DataFrame:
             resp = requests.get(url, headers=headers, timeout=10)
             if resp.status_code == 200 and resp.text:
                 html = resp.text
-                # Procurar o bloco do preço (YMlKec costuma ser a classe do preço atual)
                 candidates = re.findall(r'YMlKec[^>]*>([^<]+)<', html)
                 price = None
                 for cand in candidates:
@@ -601,7 +602,6 @@ def fetch_quotes_google_for_tickers(tickers: list) -> pd.DataFrame:
                     if price is not None:
                         break
                 if price is None:
-                    # fallback: procurar data-last-price="..."
                     m = re.search(r'data-last-price="([^"]+)"', html)
                     if m:
                         price = _parse_price_any(m.group(1))
@@ -655,11 +655,16 @@ with st.sidebar:
     mostrar_cotacoes = st.checkbox("Mostrar cotações", value=True)
     st.markdown("---")
     st.subheader("Mapeamento opcional Nome→Ticker")
-    st.write("Se a nota usa **nome da empresa** (ex.: VULCABRAS) em vez do ticker (VULC3/VCJR11), forneça um CSV `Nome,Ticker`.")
+    st.write("Se a nota usa **nome da empresa** (ex.: PETRORECSA, VULCABRAS) em vez do ticker (RECV3/VULC3), forneça um CSV `Nome,Ticker`.")
     map_file = st.file_uploader("Upload CSV de mapeamento (opcional)", type=["csv"], key="map_csv")
 
-# Mapeamento inicial (exemplos)
-default_map = {"EVEN": "EVEN3", "PETRORECSA": "RECV3", "VULCABRAS": "VULC3"}
+# Mapeamento inicial (exemplos desta conversa)
+default_map = {
+    # chaves normalizadas: só letras maiúsculas
+    "EVEN": "EVEN3",
+    "PETRORECSA": "RECV3",
+    "VULCABRAS": "VULC3",
+}
 
 # CSV extra
 if map_file is not None:
@@ -667,7 +672,8 @@ if map_file is not None:
         mdf = pd.read_csv(map_file)
         for _, row in mdf.iterrows():
             if pd.notna(row.get("Nome")) and pd.notna(row.get("Ticker")):
-                default_map[str(row["Nome"]).strip().upper()] = str(row["Ticker"]).strip().upper()
+                k = re.sub(r"[^A-Z]", "", strip_accents(str(row["Nome"])).upper())
+                default_map[k] = str(row["Ticker"]).strip().upper()
     except Exception as e:
         st.warning(f"Falha ao ler CSV de mapeamento: {e}")
 
@@ -708,10 +714,32 @@ if df_trades.empty:
     st.error("Não encontrei linhas de negociação. Tente: (i) subir o PDF original (não imagem) ou (ii) enviar um CSV Nome→Ticker.")
     st.stop()
 
+# --- GARANTIR que 'Ativo' é ticker válido (sem “nome SA”) ---
+# Remove linhas sem ticker; tenta derivar via ON/PN antes de descartar
+rows = []
+for _, r in df_trades.iterrows():
+    tkr = (r.get("Ativo") or "").strip().upper()
+    if not tkr:
+        # tenta heurística ON/PN no 'Nome'
+        guess = derive_from_on_pn(r.get("Nome", ""))
+        if guess:
+            tkr = guess
+    if not tkr:
+        # última tentativa: manter vazio (não usar nome da empresa)
+        tkr = ""
+    rows.append({**r, "Ativo": tkr})
+df_trades = pd.DataFrame(rows)
+
+# Filtrar apenas negociações com ticker reconhecido
+df_valid = df_trades[df_trades["Ativo"].str.len() > 0].copy()
+if df_valid.empty:
+    st.error("Não consegui identificar tickers nas negociações. Dica: envie um CSV Nome→Ticker (ex.: 'PETRORECSA,RECV3').")
+    st.stop()
+
 # Agregação por Ativo/Operação (base p/ rateio = valor absoluto)
-df_trades["AbsValor"] = df_trades["Valor"].abs()
+df_valid["AbsValor"] = df_valid["Valor"].abs()
 agg = (
-    df_trades.groupby(["Ativo", "Operação"], as_index=False)
+    df_valid.groupby(["Ativo", "Operação"], as_index=False)
     .agg(Quantidade=("Quantidade", "sum"),
          Valor=("Valor", "sum"),
          BaseRateio=("AbsValor", "sum"))
@@ -728,8 +756,8 @@ with col1:
 with col2:
     shown = {k: f"R$ {brl(v)}" for k, v in fees.items() if not k.startswith("_")}
     st.write(shown if shown else "(nenhum)")
-    st.caption("Regra padrão: Liquidação + Registro + Total Bovespa/Soma + Total Custos/Despesas.")
-    st.caption(f"Total (regra padrão) detectado: **R$ {brl(total_detected)}**")
+    st.caption("Regra: Liquidação + Registro + Total Bovespa/Soma + Total Custos/Despesas.")
+    st.caption(f"Total (regra) detectado: **R$ {brl(total_detected)}**")
 
 # Campo para ajuste manual
 total_costs_input = st.number_input(
@@ -738,7 +766,7 @@ total_costs_input = st.number_input(
     value=round(total_detected, 2),
     step=0.01,
     format="%.2f",
-    help="Se desejar, ajuste manualmente para casar 100% com sua expectativa."
+    help="Ajuste se necessário para casar com sua expectativa."
 )
 
 # Rateio proporcional ao valor financeiro (com correção de centavos)
@@ -803,17 +831,15 @@ if mostrar_cotacoes:
         with colr3:
             st.caption("Cache de 60s. Google: preço pontual. Yahoo: intraday c/ fallback de fechamento.")
 
-        # Data de referência (para fechamento no Yahoo)
+        # Data de referência (fechamento no Yahoo)
         ref_date = None
-        if 'data_pregao_str' in locals() and data_pregao_str:
+        if data_pregao_str:
             try:
                 ref_date = datetime.strptime(data_pregao_str, "%d/%m/%Y")
             except Exception:
                 ref_date = None
 
-        tickers_raw = out["Ativo"].fillna("").tolist()
-        tickers = clean_b3_tickers(tickers_raw)
-
+        tickers = clean_b3_tickers(out["Ativo"].fillna("").tolist())
         if not tickers:
             st.info("Nenhum ticker válido detectado para consultar.")
         else:
@@ -845,6 +871,6 @@ with st.expander("🛠️ Debug (mostrar/ocultar)"):
     st.write("Extractor usado:", _extractor_used)
     st.write("Layout detectado:", layout)
     st.write("Fees detectados:", fees)
-    total_detected, used_detail = compute_rateable_total(fees)
-    st.write("Cálculo total (regra padrão):", used_detail)
-    st.write("Agregado numérico:", out)
+    st.write("Cálculo total (regra):", compute_rateable_total(fees)[1])
+    st.write("Trades (raw):", df_trades)
+    st.write("Trades (válidos):", df_valid)
