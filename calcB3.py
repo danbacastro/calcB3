@@ -1,6 +1,6 @@
 # calcB3.py
 # Streamlit app para ler notas B3/XP (PDF), agregar negociações, ratear custos (pela base financeira),
-# calcular preço médio e exibir cotações (intraday com fallback de fechamento).
+# calcular preço médio e exibir cotações.
 # Regra de custos a ratear:
 #   Total = Liquidação + Registro + Total Bovespa/Soma + Total Custos/Despesas
 # Se algum total não existir, reconstrói a parcela com componentes atômicos equivalentes.
@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-# Deps opcionais (extratores PDF e cotações)
+# Extratores de PDF (opcionais)
 try:
     import pdfplumber
 except Exception:
@@ -32,10 +32,16 @@ try:
 except Exception:
     PyPDF2 = None
 
+# Cotações (opcionais)
 try:
     import yfinance as yf
 except Exception:
     yf = None
+
+try:
+    import requests
+except Exception:
+    requests = None
 
 
 # ---------------------------
@@ -407,7 +413,7 @@ def compute_rateable_total(fees: dict) -> tuple[float, dict]:
 
 
 # ---------------------------
-# Cotações (yfinance)
+# Cotações (Google/Yahoo)
 # ---------------------------
 
 def clean_b3_tickers(lst) -> list:
@@ -448,7 +454,7 @@ def _format_dt_local(dt) -> str:
             return str(dt)
 
 def _pick_symbol_with_data(ticker: str) -> tuple[str|None, str]:
-    """Tenta '.SA' primeiro; cai para sem sufixo. Garante histórico diário."""
+    """(Yahoo) Tenta '.SA' primeiro; cai para sem sufixo. Garante histórico diário."""
     if yf is None:
         return None, "yfinance ausente"
     candidates = [f"{ticker.upper()}.SA", ticker.upper()]
@@ -463,7 +469,7 @@ def _pick_symbol_with_data(ticker: str) -> tuple[str|None, str]:
     return None, ("sem histórico diário" if not last_err else last_err)
 
 @st.cache_data(show_spinner=False, ttl=60)
-def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) -> pd.DataFrame:
+def fetch_quotes_yahoo_for_tickers(tickers: list, ref_date: datetime | None = None) -> pd.DataFrame:
     cols = ["Ticker", "Símbolo", "Último", "Último (quando)", "Fechamento (pregão)", "Pregão (data)", "Motivo"]
     rows = []
     if yf is None or not tickers:
@@ -545,6 +551,81 @@ def fetch_quotes_for_tickers(tickers: list, ref_date: datetime | None = None) ->
 
     return pd.DataFrame(rows, columns=cols)
 
+def _parse_price_any(txt: str) -> float | None:
+    """Converte 'R$ 1.234,56' ou '1,23'/'1.23' em float."""
+    if not txt:
+        return None
+    s = re.sub(r"[^\d,\.]", "", txt)
+    if not s:
+        return None
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+@st.cache_data(show_spinner=False, ttl=60)
+def fetch_quotes_google_for_tickers(tickers: list) -> pd.DataFrame:
+    """
+    Faz scraping leve de https://www.google.com/finance/quote/<TICKER>:BVMF
+    Campos retornados: Último (com timestamp = agora BRT), Símbolo '<TICKER>:BVMF'.
+    """
+    cols = ["Ticker", "Símbolo", "Último", "Último (quando)", "Fechamento (pregão)", "Pregão (data)", "Motivo"]
+    rows = []
+    if requests is None or not tickers:
+        return pd.DataFrame(columns=cols)
+
+    now_brt = datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
+    }
+
+    for t in tickers:
+        sym = f"{t}:BVMF"
+        ultimo = None
+        motivo = ""
+        try:
+            url = f"https://www.google.com/finance/quote/{t}:BVMF"
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200 and resp.text:
+                html = resp.text
+                # Procurar o bloco do preço (YMlKec costuma ser a classe do preço atual)
+                candidates = re.findall(r'YMlKec[^>]*>([^<]+)<', html)
+                price = None
+                for cand in candidates:
+                    price = _parse_price_any(cand)
+                    if price is not None:
+                        break
+                if price is None:
+                    # fallback: procurar data-last-price="..."
+                    m = re.search(r'data-last-price="([^"]+)"', html)
+                    if m:
+                        price = _parse_price_any(m.group(1))
+                if price is not None:
+                    ultimo = price
+                else:
+                    motivo = "preço não encontrado no HTML"
+            else:
+                motivo = f"HTTP {resp.status_code}"
+        except Exception as e:
+            motivo = f"erro: {e}"
+
+        rows.append({
+            "Ticker": t,
+            "Símbolo": sym,
+            "Último": ultimo,
+            "Último (quando)": f"{now_brt} (Google)",
+            "Fechamento (pregão)": None,
+            "Pregão (data)": "",
+            "Motivo": motivo,
+        })
+
+    return pd.DataFrame(rows, columns=cols)
+
 
 # ---------------------------
 # UI
@@ -571,7 +652,7 @@ st.markdown('<div class="subtitle">Extraia, agregue e rateie custos por ativo (p
 
 with st.sidebar:
     st.header("Opções")
-    mostrar_cotacoes = st.checkbox("Mostrar cotações (yfinance)", value=True)
+    mostrar_cotacoes = st.checkbox("Mostrar cotações", value=True)
     st.markdown("---")
     st.subheader("Mapeamento opcional Nome→Ticker")
     st.write("Se a nota usa **nome da empresa** (ex.: VULCABRAS) em vez do ticker (VULC3/VCJR11), forneça um CSV `Nome,Ticker`.")
@@ -660,10 +741,9 @@ total_costs_input = st.number_input(
     help="Se desejar, ajuste manualmente para casar 100% com sua expectativa."
 )
 
-# Rateio proporcional ao valor financeiro
+# Rateio proporcional ao valor financeiro (com correção de centavos)
 alloc_series = (agg.set_index(["Ativo", "Operação"])["BaseRateio"])
 alloc_series = alloc_series / alloc_series.sum() * total_costs_input if alloc_series.sum() > 0 else alloc_series*0
-# Correção de arredondamento (centavos)
 floored = (alloc_series * 100).apply(math.floor) / 100.0
 residual = round(total_costs_input - floored.sum(), 2)
 if abs(residual) > 0:
@@ -713,40 +793,49 @@ if mostrar_cotacoes:
     with st.container():
         st.markdown('<div class="card">', unsafe_allow_html=True)
 
-        colr1, colr2 = st.columns([1, 4])
+        colr1, colr2, colr3 = st.columns([2, 1, 3])
         with colr1:
-            if st.button("🔄 Atualizar cotações"):
+            fonte = st.radio("Fonte", ["Google Finance", "Yahoo Finance"], index=0, horizontal=True)
+        with colr2:
+            if st.button("🔄 Atualizar"):
                 st.cache_data.clear()
                 st.rerun()
-        with colr2:
-            st.caption("Busca intraday 1m/5m/15m; se indisponível, usa fechamento (marcado).")
+        with colr3:
+            st.caption("Cache de 60s. Google: preço pontual. Yahoo: intraday c/ fallback de fechamento.")
 
-        if yf is None:
-            st.info("Pacote 'yfinance' não instalado. Para ver cotações, instale com: pip install yfinance")
+        # Data de referência (para fechamento no Yahoo)
+        ref_date = None
+        if 'data_pregao_str' in locals() and data_pregao_str:
+            try:
+                ref_date = datetime.strptime(data_pregao_str, "%d/%m/%Y")
+            except Exception:
+                ref_date = None
+
+        tickers_raw = out["Ativo"].fillna("").tolist()
+        tickers = clean_b3_tickers(tickers_raw)
+
+        if not tickers:
+            st.info("Nenhum ticker válido detectado para consultar.")
         else:
-            ref_date = None
-            if data_pregao_str:
-                try:
-                    ref_date = datetime.strptime(data_pregao_str, "%d/%m/%Y")
-                except Exception:
-                    ref_date = None
-
-            tickers_raw = out["Ativo"].fillna("").tolist()
-            tickers = clean_b3_tickers(tickers_raw)
-
-            if not tickers:
-                st.info("Nenhum ticker válido detectado para consultar.")
-            else:
-                quotes = fetch_quotes_for_tickers(tickers, ref_date=ref_date)
-                if quotes.empty:
-                    st.warning("Não foi possível obter cotações no momento. Mostrando símbolos e motivos:")
-                    st.dataframe(pd.DataFrame({"Ticker": tickers, "Símbolo": ["" for _ in tickers], "Motivo": ["sem dados" for _ in tickers]}),
-                                 use_container_width=True, hide_index=True)
+            if fonte == "Google Finance":
+                dfq = fetch_quotes_google_for_tickers(tickers)
+                if dfq.empty:
+                    st.warning("Não foi possível obter cotações via Google Finance (verifique conexão e 'requests').")
                 else:
-                    qfmt = quotes.copy()
+                    qfmt = dfq.copy()
+                    for c in ["Último"]:
+                        qfmt[c] = qfmt[c].map(lambda x: brl(x) if pd.notna(x) else "")
+                    st.dataframe(qfmt, use_container_width=True, hide_index=True)
+            else:
+                dfq = fetch_quotes_yahoo_for_tickers(tickers, ref_date=ref_date)
+                if dfq.empty:
+                    st.warning("Não foi possível obter cotações via Yahoo Finance.")
+                else:
+                    qfmt = dfq.copy()
                     for c in ["Último", "Fechamento (pregão)"]:
                         qfmt[c] = qfmt[c].map(lambda x: brl(x) if pd.notna(x) else "")
                     st.dataframe(qfmt, use_container_width=True, hide_index=True)
+
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== Debug (Expander) =====
@@ -756,5 +845,6 @@ with st.expander("🛠️ Debug (mostrar/ocultar)"):
     st.write("Extractor usado:", _extractor_used)
     st.write("Layout detectado:", layout)
     st.write("Fees detectados:", fees)
+    total_detected, used_detail = compute_rateable_total(fees)
     st.write("Cálculo total (regra padrão):", used_detail)
     st.write("Agregado numérico:", out)
