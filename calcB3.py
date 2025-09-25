@@ -1,8 +1,8 @@
 # calcB3.py
-# App Streamlit: múltiplos PDFs B3/XP, rateio por valor, PM, cotações (Yahoo padrão),
-# destaques nas colunas (Data do Pregão, Quantidade, Valor, Total) e "Operação" colorida.
-# Banco SQLite com: salvar ingestões, histórico de trades, export/import do DB,
-# visão mestre por ativo com drill-down de movimentações, botões "+" e deduplicação confirmada.
+# App Streamlit: múltiplos PDFs B3/XP, rateio por valor, PM, cotações (Yahoo),
+# Banco/Carteira com posições (Ativos), Movimentações do ticker abaixo,
+# TOTAL de Custos e Patrimônio, filtros, exclusão/undo e edição manual de lançamentos.
+# As notas individuais ficam escondidas em um expander (clicáveis).
 
 import io
 import os
@@ -44,7 +44,6 @@ try:
 except Exception:
     requests = None
 
-
 # =============================================================================
 # Utils
 # =============================================================================
@@ -66,12 +65,26 @@ def parse_brl_number(s: str) -> float:
 def sha1(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()
 
+def _fmt_dt_local(dt) -> str:
+    try:
+        if isinstance(dt, pd.Timestamp):
+            if dt.tzinfo is None:
+                dt = dt.tz_localize(UTC)
+            return dt.astimezone(TZ).strftime("%d/%m/%Y %H:%M")
+        if getattr(dt, "tzinfo", None) is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(TZ).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        try:
+            return pd.to_datetime(dt, utc=True).tz_convert(TZ).strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            return str(dt)
 
 # =============================================================================
 # PDF → texto
 # =============================================================================
 def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
-    # 1) pdfplumber (strict)
+    # 1) pdfplumber strict
     if pdfplumber is not None:
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -144,7 +157,6 @@ def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
             pass
     return "", "none"
 
-
 # =============================================================================
 # Tickers
 # =============================================================================
@@ -164,23 +176,25 @@ def extract_ticker_from_text(text: str) -> str | None:
 def derive_from_on_pn(text: str) -> str | None:
     t = strip_accents(text).upper()
     m = re.search(r"\b([A-Z]{3,6})\s+(ON|PN)\b", t)
-    if not m: return None
+    if not m:
+        return None
     base, cls = m.group(1), m.group(2)
     return f"{base}3" if cls == "ON" else f"{base}4"
 
 def clean_b3_tickers(lst) -> list:
     out = []
     for t in lst:
-        if not isinstance(t, str): continue
+        if not isinstance(t, str): 
+            continue
         t = strip_accents(t).upper().strip()
-        if not t: continue
+        if not t:
+            continue
         if re.fullmatch(r"[A-Z]{3,6}\d{1,2}[A-Z]?", t):
             out.append(t)
     return sorted(set(out))
 
-
 # =============================================================================
-# Parsers
+# Parsers & headers
 # =============================================================================
 def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     lines = text.splitlines()
@@ -191,7 +205,8 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     recs = []
     for line in trade_lines:
         m = pat.search(line)
-        if not m: continue
+        if not m:
+            continue
         cv = m.group("cv")
         spec = re.sub(r"\s+", " ", m.group("spec")).strip()
         qty = int(m.group("qty"))
@@ -220,7 +235,8 @@ def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFr
     recs = []
     for line in lines:
         m = pat.search(line)
-        if not m: continue
+        if not m:
+            continue
         cv_raw = m.group("cv").strip().upper()
         cv = "C" if cv_raw.startswith("C") else "V"
         spec = re.sub(r"\s+", " ", m.group("spec")).strip()
@@ -285,7 +301,6 @@ def parse_header_dates_and_net(text: str):
             break
     return data_pregao, liquido_para_data, liquido_para_valor
 
-
 # =============================================================================
 # Custos
 # =============================================================================
@@ -337,24 +352,11 @@ def compute_rateable_total(fees: dict) -> tuple[float, dict]:
     total = round(liq + reg + tb + tcd, 2); used["__total_rateio"] = total
     return total, used
 
-
 # =============================================================================
-# Quotes (Yahoo padrão + Google opcional)
+# Quotes (Yahoo + Google fallback)
 # =============================================================================
 def guess_yf_symbols_for_b3(ticker: str) -> list:
     return [f"{ticker.upper()}.SA", ticker.upper()]
-
-def _format_dt_local(dt) -> str:
-    if dt is None or pd.isna(dt): return ""
-    try:
-        if isinstance(dt, pd.Timestamp):
-            if dt.tzinfo is None: dt = dt.tz_localize(UTC)
-            return dt.astimezone(TZ).strftime("%d/%m/%Y %H:%M")
-        if getattr(dt, "tzinfo", None) is None: dt = dt.replace(tzinfo=UTC)
-        return dt.astimezone(TZ).strftime("%d/%m/%Y %H:%M")
-    except Exception:
-        try: return pd.to_datetime(dt, utc=True).tz_convert(TZ).strftime("%d/%m/%Y %H:%M")
-        except Exception: return str(dt)
 
 def _pick_symbol_with_data(ticker: str) -> tuple[str|None, str]:
     if yf is None: return None, "yfinance ausente"
@@ -414,61 +416,12 @@ def fetch_quotes_yahoo_for_tickers(tickers: list, ref_date: datetime | None = No
         rows.append({
             "Ticker": t, "Símbolo": sym or "",
             "Último": last_px,
-            "Último (quando)": (_format_dt_local(last_dt)+(" (fechamento)" if last_from_close and last_dt else "")) if last_dt else "",
+            "Último (quando)": (_fmt_dt_local(last_dt)+(" (fechamento)" if last_from_close and last_dt else "")) if last_dt else "",
             "Fechamento (pregão)": close_px,
             "Pregão (data)": close_dt.date().strftime("%d/%m/%Y") if close_dt else "",
             "Motivo": motivo,
         })
     return pd.DataFrame(rows, columns=cols)
-
-def _parse_price_any(txt: str) -> float | None:
-    if not txt: return None
-    s = re.sub(r"[^\d,\.]", "", txt)
-    if not s: return None
-    if "," in s and "." in s: s = s.replace(".","").replace(",",".")
-    elif "," in s: s = s.replace(",",".")
-    try: return float(s)
-    except Exception: return None
-
-@st.cache_data(show_spinner=False, ttl=60)
-def fetch_quotes_google_for_tickers(tickers: list) -> pd.DataFrame:
-    cols = ["Ticker","Símbolo","Último","Último (quando)","Fechamento (pregão)","Pregão (data)","Motivo"]
-    rows = []
-    if requests is None or not tickers: return pd.DataFrame(columns=cols)
-    now_brt = datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
-    hdr = {"User-Agent":"Mozilla/5.0"}
-    for t in tickers:
-        sym = f"{t}:BVMF"; ultimo = None; motivo = ""
-        try:
-            url = f"https://www.google.com/finance/quote/{t}:BVMF"
-            resp = requests.get(url, headers=hdr, timeout=10)
-            if resp.status_code == 200 and resp.text:
-                html = resp.text
-                cands = re.findall(r'YMlKec[^>]*>([^<]+)<', html)
-                price = None
-                for c in cands:
-                    price = _parse_price_any(c)
-                    if price is not None:
-                        break
-                if price is None:
-                    m = re.search(r'data-last-price="([^"]+)"', html)
-                    if m:
-                        price = _parse_price_any(m.group(1))
-                if price is not None:
-                    ultimo = price
-                else:
-                    motivo = "preço não encontrado"
-            else:
-                motivo = f"HTTP {resp.status_code}"
-        except Exception as e:
-            motivo = f"erro: {e}"
-        rows.append({
-            "Ticker": t, "Símbolo": sym, "Último": ultimo,
-            "Último (quando)": f"{now_brt} (Google)",
-            "Fechamento (pregão)": None, "Pregão (data)": "", "Motivo": motivo
-        })
-    return pd.DataFrame(rows, columns=cols)
-
 
 # =============================================================================
 # DB (SQLite)
@@ -528,17 +481,6 @@ def db_init():
         value REAL,
         FOREIGN KEY(filehash) REFERENCES ingestions(filehash) ON DELETE CASCADE
     );
-    CREATE TABLE IF NOT EXISTS quotes_snap (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        filehash TEXT,
-        ticker TEXT,
-        last REAL,
-        last_when TEXT,
-        close REAL,
-        close_date TEXT,
-        source TEXT,
-        FOREIGN KEY(filehash) REFERENCES ingestions(filehash) ON DELETE CASCADE
-    );
     """)
     conn.commit()
     conn.close()
@@ -551,7 +493,56 @@ def db_already_ingested(filehash: str) -> bool:
     conn.close()
     return ok
 
-def db_save_ingestion(res: dict, filehash: str, filename: str, quotes_df: pd.DataFrame | None = None):
+def db_delete_ingestion_with_snapshot(filehash: str) -> dict | None:
+    """Deleta uma ingestão e retorna snapshot para possível undo."""
+    conn = db_connect(); cur = conn.cursor()
+    # snapshot
+    snap = {"ing": None, "raw": [], "agg": [], "fees": []}
+    cur.execute("SELECT * FROM ingestions WHERE filehash=?", (filehash,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None
+    snap["ing"] = row
+    cur.execute("SELECT * FROM trades_raw WHERE filehash=?", (filehash,))
+    snap["raw"] = cur.fetchall()
+    cur.execute("SELECT * FROM trades_agg WHERE filehash=?", (filehash,))
+    snap["agg"] = cur.fetchall()
+    cur.execute("SELECT * FROM fees_components WHERE filehash=?", (filehash,))
+    snap["fees"] = cur.fetchall()
+    # delete (cascade on trades_*)
+    cur.execute("DELETE FROM ingestions WHERE filehash=?", (filehash,))
+    conn.commit(); conn.close()
+    return snap
+
+def db_restore_ingestion_from_snapshot(snap: dict):
+    if not snap or not snap.get("ing"):
+        return False
+    conn = db_connect(); cur = conn.cursor()
+    # columns layout as created above:
+    cur.execute("""
+        INSERT INTO ingestions (filehash, filename, layout, data_pregao, liquido_para_data, liquido_para_valor, extractor, total_rateio, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+    """, tuple(snap["ing"][0:9]))
+    for r in snap.get("raw", []):
+        cur.execute("""
+            INSERT INTO trades_raw (id, filehash, data_pregao, ativo, operacao, quantidade, preco_unit, valor, sinal_dc, nome)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, r)
+    for r in snap.get("agg", []):
+        cur.execute("""
+            INSERT INTO trades_agg (id, filehash, data_pregao, ativo, operacao, quantidade, valor, preco_medio, custos, total)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, r)
+    for r in snap.get("fees", []):
+        cur.execute("""
+            INSERT INTO fees_components (id, filehash, key, value)
+            VALUES (?,?,?,?)
+        """, r)
+    conn.commit(); conn.close()
+    return True
+
+def db_save_ingestion(res: dict, filehash: str, filename: str):
     conn = db_connect(); cur = conn.cursor()
     cur.execute("""
         INSERT OR REPLACE INTO ingestions
@@ -590,33 +581,37 @@ def db_save_ingestion(res: dict, filehash: str, filename: str, quotes_df: pd.Dat
                 float(r["Preço Médio"]) if pd.notna(r["Preço Médio"]) else None,
                 float(r["Custos"]), float(r["Total"])
             ))
-    if quotes_df is not None and not quotes_df.empty:
-        for _, r in quotes_df.iterrows():
-            cur.execute("""
-                INSERT INTO quotes_snap (filehash, ticker, last, last_when, close, close_date, source)
-                VALUES (?,?,?,?,?,?,?)
-            """, (
-                filehash, r.get("Ticker"), 
-                float(r.get("Último")) if pd.notna(r.get("Último")) else None,
-                r.get("Último (quando)"), 
-                float(r.get("Fechamento (pregão)")) if pd.notna(r.get("Fechamento (pregão)")) else None,
-                r.get("Pregão (data)"), "Yahoo"
-            ))
     conn.commit(); conn.close()
 
-def db_positions_dataframe() -> pd.DataFrame:
-    """Calcula posição e PM (médio móvel Brasil) a partir de trades_raw."""
+# ---- Views com data de corte e filtro de ativo
+def _ymd_from_br(d: str) -> str:
+    try:
+        # dd/mm/yyyy -> yyyy-mm-dd
+        return f"{d[6:10]}-{d[3:5]}-{d[0:2]}"
+    except Exception:
+        return None
+
+def db_positions_dataframe(as_of: str | None = None, filtro_ativo: str | None = None) -> pd.DataFrame:
+    """Calcula posição e PM até a data (inclusive). 'as_of' em dd/mm/aaaa."""
     conn = db_connect()
-    df = pd.read_sql_query("""
+    where = " WHERE ativo <> '' "
+    params = []
+    if as_of:
+        ymd = _ymd_from_br(as_of)
+        where += " AND date(substr(data_pregao,7,4)||'-'||substr(data_pregao,4,2)||'-'||substr(data_pregao,1,2)) <= date(?) "
+        params.append(ymd)
+    if filtro_ativo:
+        where += " AND UPPER(ativo) LIKE UPPER(?) "
+        params.append(f"%{filtro_ativo}%")
+    df = pd.read_sql_query(f"""
         SELECT id, data_pregao, ativo, operacao, quantidade, valor
         FROM trades_raw
-        WHERE ativo <> ''
+        {where}
         ORDER BY date(substr(data_pregao,7,4)||'-'||substr(data_pregao,4,2)||'-'||substr(data_pregao,1,2)) ASC, id ASC
-    """, conn)
+    """, conn, params=params)
     conn.close()
     if df.empty: 
         return pd.DataFrame(columns=["Ativo","Quantidade","PM","Custo Atual"])
-
     pos = {}
     for _, r in df.iterrows():
         t = (r["ativo"] or "").upper().strip()
@@ -628,36 +623,50 @@ def db_positions_dataframe() -> pd.DataFrame:
             new_qty = d["qty"] + q
             new_avg = (d["avg"]*d["qty"] + abs(gross)) / new_qty if new_qty else 0.0
             d["qty"], d["avg"] = new_qty, new_avg
-        else:  # venda: reduz quantidade; PM não muda
+        else:
             d["qty"] = d["qty"] - q
             if d["qty"] <= 0:
+                # zera posição; PM zera (mantemos PM por movimento, não na posição zerada)
                 d["qty"], d["avg"] = 0, 0.0
         pos[t] = d
-
     rows = []
     for t, d in sorted(pos.items()):
-        if d["qty"] != 0:
-            rows.append({"Ativo": t, "Quantidade": d["qty"], "PM": d["avg"], "Custo Atual": d["qty"]*d["avg"]})
+        rows.append({"Ativo": t, "Quantidade": d["qty"], "PM": d["avg"], "Custo Atual": d["qty"]*d["avg"]})
     return pd.DataFrame(rows).sort_values("Ativo")
 
-def db_rollup_costs_total_by_ticker() -> pd.DataFrame:
-    """Agrega Custos e Total (somatórios) a partir de trades_agg, por ticker."""
+def db_rollup_costs_total_by_ticker(as_of: str | None = None, filtro_ativo: str | None = None) -> pd.DataFrame:
+    """Somatórios de Custos e Total até a data (inclusive)."""
     conn = db_connect()
-    df = pd.read_sql_query("""
+    where = " WHERE ativo <> '' "
+    params = []
+    if as_of:
+        ymd = _ymd_from_br(as_of)
+        where += " AND date(substr(data_pregao,7,4)||'-'||substr(data_pregao,4,2)||'-'||substr(data_pregao,1,2)) <= date(?) "
+        params.append(ymd)
+    if filtro_ativo:
+        where += " AND UPPER(ativo) LIKE UPPER(?) "
+        params.append(f"%{filtro_ativo}%")
+    df = pd.read_sql_query(f"""
         SELECT ativo AS Ativo,
                COALESCE(SUM(custos),0.0) AS Custos,
                COALESCE(SUM(total),0.0)  AS Total
         FROM trades_agg
-        WHERE ativo <> ''
+        {where}
         GROUP BY ativo
-    """, conn)
+    """, conn, params=params)
     conn.close()
     return df
 
-def db_movements_for_ticker(ticker: str) -> pd.DataFrame:
-    """Movimentações agregadas por data/operacao (o que você vê nas notas) para um ticker."""
+def db_movements_for_ticker(ticker: str, as_of: str | None = None) -> pd.DataFrame:
+    """Movimentações agregadas até data para um ticker; mantém PM também nas vendas."""
     conn = db_connect()
-    df = pd.read_sql_query("""
+    where = " WHERE ativo = ? "
+    params = [ticker]
+    if as_of:
+        ymd = _ymd_from_br(as_of)
+        where += " AND date(substr(data_pregao,7,4)||'-'||substr(data_pregao,4,2)||'-'||substr(data_pregao,1,2)) <= date(?) "
+        params.append(ymd)
+    df = pd.read_sql_query(f"""
         SELECT data_pregao AS "Data do Pregão",
                operacao    AS "Operação",
                quantidade  AS "Quantidade",
@@ -666,29 +675,15 @@ def db_movements_for_ticker(ticker: str) -> pd.DataFrame:
                custos      AS "Custos",
                total       AS "Total"
         FROM trades_agg
-        WHERE ativo = ?
+        {where}
         ORDER BY date(substr(data_pregao,7,4)||'-'||substr(data_pregao,4,2)||'-'||substr(data_pregao,1,2)) ASC,
                  CASE WHEN operacao='Compra' THEN 0 ELSE 1 END
-    """, conn, params=(ticker,))
+    """, conn, params=params)
     conn.close()
     return df
 
-def db_export_bytes() -> bytes | None:
-    try:
-        return Path(DB_PATH).read_bytes() if Path(DB_PATH).exists() else None
-    except Exception:
-        return None
-
-def db_import_replace(db_bytes: bytes) -> bool:
-    try:
-        Path(DB_PATH).write_bytes(db_bytes)
-        return True
-    except Exception:
-        return False
-
-
 # =============================================================================
-# Processamento de uma nota
+# Processamento de uma nota (uploads)
 # =============================================================================
 def allocate_with_roundfix(amounts: pd.Series, total_costs: float) -> pd.Series:
     if amounts.sum() <= 0 or total_costs <= 0:
@@ -754,14 +749,11 @@ def process_one_pdf(pdf_bytes: bytes, map_dict: dict):
         "df_valid": df_valid, "out": out, "text": text,
     }
 
-
 # =============================================================================
-# UI helpers (estilo e render)
+# UI helpers
 # =============================================================================
 def style_result_df(df: pd.DataFrame) -> Any:
-    """Destaque colunas: Data do Pregão, Quantidade, Valor, Total. 'Operação' colorida."""
     cols_emphasis = [c for c in ["Data do Pregão","Quantidade","Valor","Total"] if c in df.columns]
-
     sty = df.style.format({
         "Quantidade": "{:.0f}",
         "Valor": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
@@ -769,8 +761,6 @@ def style_result_df(df: pd.DataFrame) -> Any:
         "Custos": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
         "Total": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
     })
-
-    # Cor na coluna Operação
     def op_style(v: Any) -> str:
         if isinstance(v, str):
             s = v.strip().lower()
@@ -779,8 +769,6 @@ def style_result_df(df: pd.DataFrame) -> Any:
         return ""
     if "Operação" in df.columns:
         sty = sty.applymap(op_style, subset=["Operação"])
-
-    # Destaque de colunas
     if cols_emphasis:
         sty = sty.set_properties(
             subset=cols_emphasis,
@@ -794,7 +782,6 @@ def style_result_df(df: pd.DataFrame) -> Any:
                 "props": [("border","1px solid #e5e7eb"),("background-color","#f6f7f9"),("font-weight","700")]
             })
         sty = sty.set_table_styles(table_styles, overwrite=False)
-
     sty = sty.set_properties(**{"border":"1px solid #e5e7eb"})
     return sty
 
@@ -805,12 +792,11 @@ def render_result_table(df: pd.DataFrame):
     except Exception:
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-
 # =============================================================================
 # APP
 # =============================================================================
 st.set_page_config(page_title="Calc B3 - Nota de Corretagem", layout="wide")
-db_init()  # inicializa o banco
+db_init()
 
 st.markdown("""
 <style>
@@ -826,33 +812,32 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="big-title">Calc B3 – Nota de Corretagem</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Upload múltiplo de notas B3/XP. Agregue, rateie por valor, calcule PM e veja cotações (Yahoo padrão).</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Consolidado de notas B3/XP, carteira e movimentações com PM, custos, patrimônio e cotações.</div>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Opções")
-    mostrar_cotacoes = st.checkbox("Mostrar cotações", value=True)
-    fonte = st.radio("Fonte das cotações", ["Yahoo Finance","Google Finance"], index=0)
-    if st.button("🔄 Atualizar cotações", use_container_width=True):
+    if st.button("🔄 Recarregar/limpar cache", use_container_width=True):
         st.cache_data.clear(); st.rerun()
 
     st.markdown("---")
     st.subheader("Banco de dados")
     try:
-        st.caption(f"Arquivo DB: `{DB_PATH.resolve()}`")
+        st.caption(f"Arquivo DB: `{Path('carteira.db').resolve()}`")
     except Exception:
         st.caption("Arquivo DB: carteira.db")
-    db_bytes = db_export_bytes()
-    if db_bytes:
-        st.download_button("⬇️ Exportar DB (carteira.db)", data=db_bytes, file_name="carteira.db", mime="application/octet-stream", use_container_width=True)
+    # Export
+    if Path("carteira.db").exists():
+        st.download_button("⬇️ Exportar DB (carteira.db)", data=Path("carteira.db").read_bytes(),
+                           file_name="carteira.db", mime="application/octet-stream", use_container_width=True)
+    # Import
     db_up = st.file_uploader("⬆️ Importar/Substituir DB (.db)", type=["db","sqlite"], key="db_upload")
     if db_up and st.button("Substituir banco atual", use_container_width=True):
-        ok = db_import_replace(db_up.read())
-        if ok:
+        try:
+            Path("carteira.db").write_bytes(db_up.read())
             st.success("Banco substituído com sucesso.")
-            st.cache_data.clear()
-            st.rerun()
-        else:
-            st.error("Falha ao substituir o banco.")
+            st.cache_data.clear(); st.rerun()
+        except Exception as e:
+            st.error(f"Falha ao substituir o banco: {e}")
 
     st.markdown("---")
     st.subheader("Mapeamento opcional Nome→Ticker")
@@ -870,219 +855,243 @@ if map_file is not None:
     except Exception as e:
         st.warning(f"Falha ao ler CSV: {e}")
 
+# ========================= Uploads & processamento ============================
 uploads = st.file_uploader("Carregue um ou mais PDFs da B3/XP", type=["pdf"], accept_multiple_files=True, key="pdfs")
-if not uploads:
-    st.info("Envie um ou mais arquivos PDF para começar."); st.stop()
-
 results = []
-for f in uploads:
-    try:
-        pdf_bytes = f.read()
-        res = process_one_pdf(pdf_bytes, default_map)
-        res["filename"] = f.name
-        res["filehash"] = sha1(pdf_bytes)
-    except Exception as e:
-        res = {"ok": False, "error": str(e), "filename": f.name, "filehash": "NA"}
-    results.append(res)
+if uploads:
+    for f in uploads:
+        try:
+            pdf_bytes = f.read()
+            res = process_one_pdf(pdf_bytes, default_map)
+            res["filename"] = f.name
+            res["filehash"] = sha1(pdf_bytes)
+        except Exception as e:
+            res = {"ok": False, "error": str(e), "filename": f.name, "filehash": "NA"}
+        results.append(res)
 
-tab_titles = ["Consolidado"] + [r.get("filename", f"Arquivo {i+1}") for i, r in enumerate(results)] + ["📦 Banco/Carteira"]
-tabs = st.tabs(tab_titles)
-
-# Abas individuais (uma por PDF)
-for idx, res in enumerate(results, start=1):
-    with tabs[idx]:
-        st.markdown(f"### 📄 {res.get('filename','Arquivo')}")
-        if not res.get("ok"):
-            st.error(res.get("error","Erro ao processar")); continue
-        layout = res["layout"]; _badge_cls = "badge-xp" if layout=="XP" else "badge-b3"
-        st.markdown(f'<div class="muted">Layout detectado: <span class="badge {_badge_cls}">{layout}</span> • Extrator: {res["extractor"]}</div>', unsafe_allow_html=True)
-
-        colA, colB, colC, colD = st.columns(4)
-        with colA: st.markdown(f'<div class="card"><div class="section-title">Data do Pregão</div><div class="muted">{res["data_pregao"] or "—"}</div></div>', unsafe_allow_html=True)
-        with colB: st.markdown(f'<div class="card"><div class="section-title">Líquido para (Data)</div><div class="muted">{res["liquido_para_data"] or "—"}</div></div>', unsafe_allow_html=True)
-        with colC: st.markdown(f'<div class="card"><div class="section-title">Líquido para (Valor)</div><div class="muted">R$ {res["liquido_para_valor"] or "—"}</div></div>', unsafe_allow_html=True)
-        with colD:
-            now_local = datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
-            st.markdown(f'<div class="card"><div class="section-title">Agora (BRT)</div><div class="muted">{now_local}</div></div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="section-title">📊 Resultado</div>', unsafe_allow_html=True)
-        with st.container():
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            render_result_table(res["out"][["Data do Pregão","Ativo","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
-            csv_bytes = res["out"].to_csv(index=False).encode("utf-8-sig")
-            st.download_button("Baixar CSV (nota)", data=csv_bytes, file_name=f"resultado_{res['filename']}.csv", mime="text/csv")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        # --- botão "+" (adicionar ao banco) com deduplicação/confirm ---
-        with st.container():
-            col_s1, col_s2 = st.columns([1,3])
-            with col_s1:
-                key_add = f"add_{res['filehash']}"
-                if st.button(f"➕ Adicionar ao banco", key=key_add):
-                    if db_already_ingested(res["filehash"]):
-                        st.warning("Esta nota já existe no banco (mesmo filehash).")
-                        st.info("Se quiser duplicar mesmo assim, clique abaixo.")
-                        if st.button("✅ Salvar duplicado mesmo assim", key=f"dup_{res['filehash']}"):
-                            tickers_note = clean_b3_tickers(res["out"]["Ativo"].astype(str).tolist())
-                            quotes_note = fetch_quotes_yahoo_for_tickers(tickers_note) if tickers_note else None
-                            filehash_dup = f"{res['filehash']}:dup:{int(_now())}"
-                            db_save_ingestion(res, filehash_dup, res["filename"], quotes_note)
-                            st.success("Duplicado salvo no banco!")
-                    else:
-                        tickers_note = clean_b3_tickers(res["out"]["Ativo"].astype(str).tolist())
-                        quotes_note = fetch_quotes_yahoo_for_tickers(tickers_note) if tickers_note else None
-                        db_save_ingestion(res, res["filehash"], res["filename"], quotes_note)
-                        st.success("Salvo no banco!")
-
-        with st.expander("🛠️ Debug (mostrar/ocultar)"):
-            text = res.get("text","")
-            st.text_area("Texto extraído (primeiros 3000 chars)", value=text[:3000], height=240)
-            st.write("Fees detectados:", res["fees"])
-            st.write("Cálculo total (regra):", res["used_detail"])
-
-# Aba Consolidado (por Data do Pregão + Ativo + Operação)
-with tabs[0]:
-    st.markdown("### 📚 Consolidado")
+# ================================ Consolidado =================================
+st.markdown("## 📚 Consolidado (dos PDFs carregados agora)")
+if not results:
+    st.info("Envie um ou mais arquivos PDF para ver o consolidado.")
+else:
     valid_outs = [r["out"] for r in results if r.get("ok")]
     if not valid_outs:
-        st.info("Nenhuma nota válida processada.")
+        st.warning("Nenhuma nota válida processada.")
     else:
         all_out = pd.concat(valid_outs, ignore_index=True)
-        cons = (
-            all_out.groupby(["Data do Pregão","Ativo","Operação"], as_index=False)
-            .agg(Quantidade=("Quantidade","sum"),
-                 Valor=("Valor","sum"),
-                 Custos=("Custos","sum"),
-                 Total=("Total","sum"))
-            .sort_values(["Data do Pregão","Ativo","Operação"])
-        )
-        cons["Preço Médio"] = cons.apply(lambda r: (abs(r["Valor"])/r["Quantidade"]) if r["Quantidade"] else None, axis=1)
+        # Filtros rápidos: Compra/Venda, FIIs x Ações
+        colf1, colf2, colf3 = st.columns([1,1,2])
+        with colf1:
+            fil_compra = st.checkbox("Mostrar Compras", True)
+            fil_venda  = st.checkbox("Mostrar Vendas", True)
+        with colf2:
+            apenas_fiis   = st.checkbox("Só FIIs (..11)", False)
+            apenas_acoes  = st.checkbox("Só Ações (..3/4/5/6)", False)
+        with colf3:
+            filtro_ticker = st.text_input("Filtro por ticker (contém)", "")
+
+        dfc = all_out.copy()
+        if not fil_compra:
+            dfc = dfc[dfc["Operação"] != "Compra"]
+        if not fil_venda:
+            dfc = dfc[dfc["Operação"] != "Venda"]
+        if apenas_fiis and not apenas_acoes:
+            dfc = dfc[dfc["Ativo"].str.contains(r"11[A-Z]?$", regex=True, na=False)]
+        if apenas_acoes and not apenas_fiis:
+            dfc = dfc[dfc["Ativo"].str.contains(r"[3456][A-Z]?$", regex=True, na=False)]
+        if filtro_ticker:
+            dfc = dfc[dfc["Ativo"].str.contains(filtro_ticker, case=False, na=False)]
+        # recomputa PM da linha filtrada (defensivo)
+        dfc["Preço Médio"] = dfc.apply(lambda r: (abs(r["Valor"])/r["Quantidade"]) if r["Quantidade"] else None, axis=1)
+
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        render_result_table(cons[["Data do Pregão","Ativo","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
-        csv_cons = cons.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("Baixar CSV (consolidado)", data=csv_cons, file_name="resultado_consolidado.csv", mime="text/csv")
+        render_result_table(dfc[["Data do Pregão","Ativo","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+        csv_cons = dfc.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("Baixar CSV (consolidado atual)", data=csv_cons, file_name="resultado_consolidado.csv", mime="text/csv")
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # botão "+" para adicionar TODAS
-        st.markdown("#### ➕ Adicionar TODAS as notas carregadas ao banco")
-        allow_dups = st.checkbox("Permitir duplicados", value=False, help="Se marcado, notas já existentes serão salvas com sufixo de duplicata.")
-        if st.button("➕ Adicionar todas"):
+        # ➕ Adicionar ao banco (todas ou selecionar)
+        st.markdown("#### ➕ Adicionar PDFs carregados ao banco")
+        allow_dups = st.checkbox("Permitir duplicados (por filehash)", value=False)
+        if st.button("➕ Adicionar todas as notas visíveis"):
             inserted = 0; duplicated = 0
             for r in results:
-                if not r.get("ok"): continue
+                if not r.get("ok"): 
+                    continue
                 fh = r["filehash"]
                 if db_already_ingested(fh) and not allow_dups:
                     duplicated += 1
                     continue
-                tickers_note = clean_b3_tickers(r["out"]["Ativo"].astype(str).tolist())
-                quotes_note = fetch_quotes_yahoo_for_tickers(tickers_note) if tickers_note else None
                 if db_already_ingested(fh) and allow_dups:
                     fh = f"{fh}:dup:{int(_now())}"
-                db_save_ingestion(r, fh, r["filename"], quotes_note)
+                db_save_ingestion(r, fh, r["filename"])
                 inserted += 1
             if inserted:
                 st.success(f"{inserted} nota(s) adicionada(s) ao banco.")
             if duplicated and not allow_dups:
-                st.warning(f"{duplicated} nota(s) já existiam e foram ignoradas. Marque 'Permitir duplicados' para forçar.")
+                st.warning(f"{duplicated} nota(s) já existiam e foram ignoradas.")
 
-# Cotações (padrão Yahoo ou Google)
-if mostrar_cotacoes:
-    st.markdown('<div class="section-title">💹 Cotações</div>', unsafe_allow_html=True)
-    with st.container():
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        tickers = []
+# Notas individuais escondidas (opcional)
+if results:
+    with st.expander("🗂️ Notas individuais (opcional)"):
         for r in results:
-            if r.get("ok"): tickers.extend(r["out"]["Ativo"].dropna().astype(str).tolist())
-        tickers = clean_b3_tickers(tickers)
-        colr1, colr2 = st.columns([4,1])
-        with colr1: st.caption("Fonte padrão: Yahoo Finance • Cache 60s • Use o botão para atualizar.")
-        with colr2:
-            if st.button("🔄 Atualizar cotações (global)"):
-                st.cache_data.clear(); st.rerun()
-        if not tickers:
-            st.info("Nenhum ticker válido detectado para consultar.")
-        else:
-            if fonte == "Yahoo Finance":
-                dfq = fetch_quotes_yahoo_for_tickers(tickers, ref_date=None)
-                if dfq.empty:
-                    st.warning("Não foi possível obter cotações via Yahoo Finance.")
-                else:
-                    qfmt = dfq.copy()
-                    for c in ["Último","Fechamento (pregão)"]:
-                        qfmt[c] = qfmt[c].map(lambda x: brl(x) if pd.notna(x) else "")
-                    st.dataframe(qfmt, use_container_width=True, hide_index=True)
-            else:
-                dfq = fetch_quotes_google_for_tickers(tickers)
-                if dfq.empty:
-                    st.warning("Não foi possível obter cotações via Google Finance.")
-                else:
-                    qfmt = dfq.copy(); qfmt["Último"] = qfmt["Último"].map(lambda x: brl(x) if pd.notna(x) else "")
-                    st.dataframe(qfmt, use_container_width=True, hide_index=True)
+            st.markdown(f"**{r.get('filename','Arquivo')}** — hash `{r.get('filehash')}`")
+            if not r.get("ok"):
+                st.error(r.get("error","Erro ao processar")); 
+                continue
+            layout = r["layout"]; _badge_cls = "badge-xp" if layout=="XP" else "badge-b3"
+            st.markdown(f'<span class="badge {_badge_cls}">{layout}</span> • Extrator: {r["extractor"]}', unsafe_allow_html=True)
+            render_result_table(r["out"][["Data do Pregão","Ativo","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+            colb1, colb2 = st.columns([1,4])
+            with colb1:
+                if st.button(f"➕ Adicionar esta nota", key=f"add_{r['filehash']}"):
+                    fh = r["filehash"]
+                    if db_already_ingested(fh):
+                        st.warning("Esta nota já existe no banco (mesmo filehash). Clique novamente para salvar duplicado.")
+                        if st.button("✅ Salvar duplicado mesmo assim", key=f"dup_{r['filehash']}"):
+                            db_save_ingestion(r, f"{fh}:dup:{int(_now())}", r["filename"])
+                            st.success("Duplicado salvo.")
+                    else:
+                        db_save_ingestion(r, fh, r["filename"])
+                        st.success("Salvo no banco.")
+
+# ================================ Banco / Carteira ============================
+st.markdown("## 📦 Banco / Carteira")
+
+# Filtros (DB)
+colfL, colfR = st.columns([2,2])
+with colfL:
+    filtro_txt = st.text_input("Filtro por ativo (contém)", "")
+with colfR:
+    data_ate = st.date_input("Data de corte (até)", value=datetime.now(TZ).date())
+data_ate_str = datetime.strftime(datetime.combine(data_ate, datetime.min.time()), "%d/%m/%Y")
+
+# Tabela Ativos (posição + cotação + patrimônio) + linha TOTAL
+df_pos = db_positions_dataframe(as_of=data_ate_str, filtro_ativo=filtro_txt)
+df_ct  = db_rollup_costs_total_by_ticker(as_of=data_ate_str, filtro_ativo=filtro_txt)
+df_master = pd.merge(df_pos, df_ct, on="Ativo", how="outer").fillna({"Quantidade":0,"PM":0.0,"Custo Atual":0.0,"Custos":0.0,"Total":0.0})
+df_master = df_master.sort_values("Ativo")
+
+tickers_all = clean_b3_tickers(df_master["Ativo"].tolist())
+quotes_df = fetch_quotes_yahoo_for_tickers(tickers_all) if tickers_all else pd.DataFrame()
+last_map = {r["Ticker"]: r["Último"] for _, r in quotes_df.iterrows()} if not quotes_df.empty else {}
+
+df_master["Cotação"] = df_master["Ativo"].map(last_map)
+df_master["Patrimônio"] = df_master.apply(lambda r: (r["Quantidade"] * r["Cotação"]) if (pd.notna(r["Cotação"]) and r["Quantidade"]>0) else 0.0, axis=1)
+
+# Linha TOTAL (Custos e Patrimônio)
+total_row = {
+    "Ativo":"TOTAL",
+    "Quantidade": df_master["Quantidade"].sum(skipna=True),
+    "PM": None,
+    "Custo Atual": df_master["Custo Atual"].sum(skipna=True),
+    "Custos": df_master["Custos"].sum(skipna=True),
+    "Total": df_master["Total"].sum(skipna=True),
+    "Cotação": None,
+    "Patrimônio": df_master["Patrimônio"].sum(skipna=True),
+}
+df_master_tot = pd.concat([df_master, pd.DataFrame([total_row])], ignore_index=True)
+
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.markdown("#### Ativos")
+st.dataframe(
+    df_master_tot[["Ativo","Quantidade","PM","Cotação","Custos","Total","Patrimônio"]],
+    use_container_width=True, hide_index=True,
+    column_config={
+        "Quantidade": st.column_config.NumberColumn(format="%.0f"),
+        "PM": st.column_config.NumberColumn(format="R$ %.2f"),
+        "Cotação": st.column_config.NumberColumn(format="R$ %.2f"),
+        "Custos": st.column_config.NumberColumn(format="R$ %.2f"),
+        "Total": st.column_config.NumberColumn(format="R$ %.2f"),
+        "Patrimônio": st.column_config.NumberColumn(format="R$ %.2f"),
+    }
+)
+st.caption("Patrimônio = Quantidade × Cotação (0 quando posição zerada). Linha TOTAL soma Custos e Patrimônio.")
+st.markdown('</div>', unsafe_allow_html=True)
+
+# Movimentações do ticker (abaixo da tabela)
+choices = sorted([t for t in df_master["Ativo"].dropna().astype(str).unique().tolist() if t != "TOTAL"])
+pick = st.selectbox("🔎 Escolha o ativo para ver as movimentações", choices, index=0 if choices else None)
+if pick:
+    df_mov = db_movements_for_ticker(pick, as_of=data_ate_str)
+    if df_mov.empty:
+        st.info("Sem movimentações para este ticker no período.")
+    else:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown(f"#### Movimentações – {pick}")
+        # Mantém PM também nas vendas; adiciona uma coluna Patrimônio (0 em vendas; nas compras pode refletir o valor da operação)
+        df_mov_view = df_mov.copy()
+        df_mov_view["Patrimônio"] = df_mov_view.apply(lambda r: 0.0 if str(r["Operação"]).lower()=="venda" else abs(r["Valor"]), axis=1)
+        render_result_table(df_mov_view[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total","Patrimônio"]])
         st.markdown('</div>', unsafe_allow_html=True)
 
-# Aba Banco/Carteira
-with tabs[-1]:
-    st.markdown("### 📦 Banco / Carteira")
+# Gerenciamento de ingestões: excluir/undo e edição manual
+st.markdown("### ⚙️ Gerenciar banco")
 
-    # Visão mestre por ativo (posição + custos e total acumulados)
-    df_pos = db_positions_dataframe()
-    df_ct = db_rollup_costs_total_by_ticker()
-    if df_pos.empty and df_ct.empty:
-        st.info("Nenhuma posição. Use os botões ➕ para salvar notas no banco.")
+with st.expander("🗑️ Excluir/estornar uma ingestão (com undo)"):
+    # lista simples de ingestions
+    conn = db_connect()
+    df_ing = pd.read_sql_query("SELECT filehash, filename, layout, data_pregao, created_at FROM ingestions ORDER BY created_at DESC", conn)
+    conn.close()
+    if df_ing.empty:
+        st.info("Não há ingestões salvas.")
     else:
-        # Merge por ativo
-        df_master = pd.merge(df_pos, df_ct, on="Ativo", how="outer").fillna({"Quantidade":0,"PM":0.0,"Custo Atual":0.0,"Custos":0.0,"Total":0.0})
-        df_master = df_master.sort_values("Ativo")
-
-        colL, colR = st.columns([2,1])
-        with colL:
-            st.markdown("#### Ativos (mestre)")
-            st.dataframe(
-                df_master[["Ativo","Quantidade","PM","Custos","Total"]],
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "Quantidade": st.column_config.NumberColumn(format="%.0f"),
-                    "PM": st.column_config.NumberColumn(format="R$ %.2f"),
-                    "Custos": st.column_config.NumberColumn(format="R$ %.2f"),
-                    "Total": st.column_config.NumberColumn(format="R$ %.2f"),
-                }
-            )
-            st.caption("Quantidade e PM são posição líquida (método médio móvel). Custos/Total são somatórios das negociações no histórico.")
-
-        with colR:
-            st.markdown("#### 🔎 Movimentações do ticker")
-            choices = sorted(df_master["Ativo"].dropna().astype(str).unique().tolist())
-            pick = st.selectbox("Escolha o ativo", choices, index=0 if choices else None)
-            if pick:
-                df_mov = db_movements_for_ticker(pick)
-                if df_mov.empty:
-                    st.info("Sem movimentações para este ticker.")
+        st.dataframe(df_ing, use_container_width=True, hide_index=True)
+        fh_sel = st.selectbox("Selecione o filehash para excluir", df_ing["filehash"].tolist())
+        if st.button("Excluir ingestão selecionada"):
+            snap = db_delete_ingestion_with_snapshot(fh_sel)
+            if snap:
+                st.session_state["last_deleted_snap"] = snap
+                st.success("Ingestão excluída. Você pode desfazer abaixo.")
+            else:
+                st.warning("Ingestão não encontrada.")
+        if st.button("↩️ Desfazer última exclusão"):
+            snap = st.session_state.get("last_deleted_snap")
+            if snap:
+                ok = db_restore_ingestion_from_snapshot(snap)
+                if ok:
+                    st.success("Exclusão desfeita (ingestão restaurada).")
                 else:
-                    render_result_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+                    st.error("Falha ao restaurar.")
+            else:
+                st.info("Nada para desfazer.")
 
-    # Opcional: resumo de marcação a mercado usando df_pos + cotações
-    st.markdown("#### Marcação a mercado (rápido)")
-    if not (df_pos is None or df_pos.empty):
-        tickers_all = clean_b3_tickers(df_pos["Ativo"].tolist())
-        qdf = fetch_quotes_yahoo_for_tickers(tickers_all) if tickers_all else pd.DataFrame()
-        last_map = {r["Ticker"]: r["Último"] for _, r in qdf.iterrows()} if not qdf.empty else {}
-        df_mv = df_pos.copy()
-        df_mv["Último"] = df_mv["Ativo"].map(last_map)
-        df_mv["Patrimônio"] = df_mv.apply(lambda r: (r["Quantidade"] * r["Último"]) if pd.notna(r["Último"]) else None, axis=1)
-        df_mv["P&L Não Real."] = df_mv.apply(lambda r: (r["Patrimônio"] - r["Custo Atual"]) if pd.notna(r["Patrimônio"]) else None, axis=1)
-        st.dataframe(
-            df_mv[["Ativo","Quantidade","PM","Custo Atual","Último","Patrimônio","P&L Não Real."]],
-            use_container_width=True, hide_index=True,
-            column_config={
-                "Quantidade": st.column_config.NumberColumn(format="%.0f"),
-                "PM": st.column_config.NumberColumn(format="R$ %.2f"),
-                "Custo Atual": st.column_config.NumberColumn(format="R$ %.2f"),
-                "Último": st.column_config.NumberColumn(format="R$ %.2f"),
-                "Patrimônio": st.column_config.NumberColumn(format="R$ %.2f"),
-                "P&L Não Real.": st.column_config.NumberColumn(format="R$ %.2f"),
-            }
-        )
-        total_patr = df_mv["Patrimônio"].sum(skipna=True) if "Patrimônio" in df_mv else 0.0
-        total_custo = df_mv["Custo Atual"].sum(skipna=True) if "Custo Atual" in df_mv else 0.0
-        st.caption(f"Total investido: **R$ {brl(total_custo)}** • Patrimônio marcado a mercado: **R$ {brl(total_patr)}**")
+with st.expander("✏️ Edição manual de um lançamento (trades_raw)"):
+    # escolha por ticker -> mostra registros e permite editar um
+    conn = db_connect()
+    df_raw_all = pd.read_sql_query("""
+        SELECT id, data_pregao, ativo, operacao, quantidade, preco_unit, valor, filehash
+        FROM trades_raw
+        ORDER BY id DESC
+    """, conn)
+    conn.close()
+    if df_raw_all.empty:
+        st.info("Nenhum lançamento para editar.")
+    else:
+        st.dataframe(df_raw_all.head(200), use_container_width=True, hide_index=True)
+        edit_id = st.number_input("ID para editar", min_value=1, step=1)
+        if st.button("Carregar ID"):
+            row = df_raw_all[df_raw_all["id"]==edit_id]
+            if row.empty:
+                st.warning("ID não encontrado.")
+            else:
+                r = row.iloc[0]
+                with st.form("edit_form"):
+                    data_p = st.text_input("Data do Pregão (dd/mm/aaaa)", value=str(r["data_pregao"]))
+                    ativo  = st.text_input("Ativo", value=str(r["ativo"]))
+                    oper   = st.selectbox("Operação", ["Compra","Venda"], index=0 if str(r["operacao"])=="Compra" else 1)
+                    qtd    = st.number_input("Quantidade", value=int(r["quantidade"]), step=1)
+                    punit  = st.number_input("Preço Unitário", value=float(r["preco_unit"] or 0.0), step=0.01, format="%.2f")
+                    valor  = st.number_input("Valor (positivo compra, negativo venda)", value=float(r["valor"]), step=0.01, format="%.2f")
+                    submitted = st.form_submit_button("Salvar alterações")
+                    if submitted:
+                        conn = db_connect(); cur = conn.cursor()
+                        cur.execute("""
+                            UPDATE trades_raw
+                            SET data_pregao=?, ativo=?, operacao=?, quantidade=?, preco_unit=?, valor=?
+                            WHERE id=?
+                        """, (data_p, ativo.upper().strip(), oper, int(qtd), float(punit), float(valor), int(edit_id)))
+                        conn.commit(); conn.close()
+                        st.success("Lançamento atualizado. Recarregue para refletir posições.")
 
+# Fim
