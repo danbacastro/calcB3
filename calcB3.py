@@ -810,7 +810,7 @@ def style_portfolio_df(df: pd.DataFrame) -> Any:
     if cols_emphasis:
         sty = sty.set_properties(
             subset=cols_emphasis,
-            **{"border-left":"1px solid #e5e7eb","border-right":"1px solid #e5e7eb","background-color":"#f6f7f9","font-weight":"700"}
+            **{"border-left":"1px solid #e5e7eb","border-right":"1px solid #e5e7eb,"font-weight":"700"}
         )
     sty = sty.set_properties(**{"border":"1px solid #e5e7eb"})
     return sty
@@ -997,7 +997,7 @@ total_row = {
     "Quantidade": df_master["Quantidade"].sum(skipna=True),
     "PM": None,
     "Custo Atual": df_master["Custo Atual"].sum(skipna=True),
-    "Total": df_master["Total"].sum(skipna=True),
+    "Total": None,
     "Cotação": None,
     "Patrimônio": df_master["Patrimônio"].sum(skipna=True),
 }
