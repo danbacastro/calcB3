@@ -372,7 +372,7 @@ def _pick_symbol_with_data(ticker: str) -> tuple[str|None, str]:
             last_err = str(e)
     return None, ("sem histórico diário" if not last_err else last_err)
 
-@st.cache_data(show_spinner=False, ttl=30)
+@st.cache_data(show_spinner=False, ttl=25)
 def fetch_quotes_yahoo_for_tickers(tickers: list, ref_date: datetime | None = None, _salt: int = 0) -> pd.DataFrame:
     # _salt serve para “furar” o cache em auto-refresh
     cols = ["Ticker","Símbolo","Último","Último (quando)","Fechamento (pregão)","Pregão (data)","Motivo"]
@@ -851,9 +851,6 @@ with st.sidebar:
         st.cache_data.clear(); st.rerun()
 
     st.markdown("---")
-    st.subheader("Cotações")
-    auto_quotes = st.checkbox("Auto-atualizar cotações", value=True)
-    interval_sec = st.number_input("Intervalo (segundos)", min_value=15, value=60, step=5)
     # contador de autorefresh (se lib estiver instalada). Usado como "sal" do cache.
     salt = 0
     if auto_quotes and st_autorefresh is not None:
