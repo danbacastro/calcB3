@@ -1,7 +1,7 @@
 # calcB3.py
 # Streamlit app para ler notas B3/XP (PDF), agregar negociações, ratear custos (pela base financeira),
-# calcular preço médio e exibir cotações (com fallback noturno).
-# Regra de custos a ratear (padrão):
+# calcular preço médio e exibir cotações (intraday com fallback de fechamento).
+# Regra de custos a ratear:
 #   Total = Liquidação + Registro + Total Bovespa/Soma + Total Custos/Despesas
 # Se algum total não existir, reconstrói a parcela com componentes atômicos equivalentes.
 # Uso: streamlit run calcB3.py
@@ -248,7 +248,7 @@ def detect_layout(text: str) -> str:
     xp_hits = 0
     for m in [
         "data da consulta", "data de referencia", "conta xp", "codigo assessor",
-        "corretagem / despesas",  # label típico do quadro XP
+        "corretagem / despesas",
         "atendimento ao cliente: +55 11 4003-3710", "ouvidoria: 0800 722 3730",
         "xp investimentos cctvm", "https://www.xpi.com.br/"
     ]:
@@ -276,48 +276,50 @@ def detect_layout(text: str) -> str:
     return "XP" if "conta xp" in t or "data da consulta" in t else "B3"
 
 def parse_header_dates_and_net(text: str):
-    """Extrai Data do Pregão / Líquido para <data/valor> de forma tolerante (B3/XP)."""
+    """Extrai Data do Pregão e 'Líquido para (data/valor)' de forma robusta (B3/XP)."""
     lines = text.splitlines()
-    pairs = list(zip(lines, [strip_accents(l).lower() for l in lines]))
+    norms = [strip_accents(l).lower() for l in lines]
+    pairs = list(zip(lines, norms))
 
-    date_labels = ("data do preg", "data preg", "data da negoc", "data negoc", "negociacao", "negociação", "pregao")
     data_pregao = None
-    for raw, norm in pairs[:120]:
-        if any(lbl in norm for lbl in date_labels):
-            m = re.search(r"(\d{2}/\d{2}/\d{4})", raw)
-            if m:
-                data_pregao = m.group(1)
+
+    # 1) Prioridade: rótulos explícitos (ignora 'consulta/referência')
+    label_pats = [
+        r"data\s*do\s*preg[aã]o",
+        r"data\s*da\s*negocia[cç][aã]o",
+        r"\bnegocia[cç][aã]o\b"
+    ]
+    for raw, norm in pairs[:200]:
+        if any(re.search(p, norm) for p in label_pats):
+            md = re.search(r"(\d{2}/\d{2}/\d{4})", raw)
+            if md:
+                data_pregao = md.group(1)
                 break
+
+    # 2) Fallback: primeira data no topo sem "consulta/referenc/liquido" e não-CNPJ
     if not data_pregao:
         for raw, norm in pairs[:120]:
-            if re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", raw):
+            if ("consulta" in norm) or ("referenc" in norm) or ("liquido" in norm) or ("l\u00edquido" in norm):
                 continue
-            m = re.search(r"(\d{2}/\d{2}/\d{4})", raw)
-            if m:
-                data_pregao = m.group(1)
+            if re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", raw):  # CNPJ
+                continue
+            md = re.search(r"(\d{2}/\d{2}/\d{4})", raw)
+            if md:
+                data_pregao = md.group(1)
                 break
 
+    # 3) 'Líquido para' (data/valor) — varre de baixo pra cima
     liquido_para_data = None
     liquido_para_valor = None
     for raw, norm in pairs[::-1]:
         if ("liquido para" in norm) or ("l\u00edquido para" in norm):
-            md = re.search(r"(?:L[ií]quido para)\s+(\d{2}/\d{2}/\d{4})", raw)
+            md = re.search(r"(\d{2}/\d{2}/\d{4})", raw)
             if md:
                 liquido_para_data = md.group(1)
             vals = re.findall(r"(\d{1,3}(?:\.\d{3})*,\d{2})", raw)
             if vals:
                 liquido_para_valor = vals[-1]
             break
-
-    if data_pregao and liquido_para_data and data_pregao == liquido_para_data:
-        for raw, norm in pairs[:160]:
-            m = re.findall(r"(\d{2}/\d{2}/\d{4})", raw)
-            for d in m:
-                if d != liquido_para_data:
-                    data_pregao = d
-                    break
-            if data_pregao != liquido_para_data:
-                break
 
     return data_pregao, liquido_para_data, liquido_para_valor
 
@@ -329,11 +331,11 @@ def parse_header_dates_and_net(text: str):
 def parse_cost_components(text: str) -> dict:
     """
     Extrai componentes/agrupados de custo (B3/XP) evitando dupla contagem.
-    Também padroniza rótulos de totais (B3: "Total Custos / Despesas"; XP: "Total Corretagem / Despesas").
+    Padroniza rótulos de totais (B3: "Total Custos / Despesas"; XP: "Total Corretagem / Despesas").
     """
     components = {}
 
-    # Atomics (rótulos mais comuns)
+    # Atomics
     atom_pats = {
         "liquidacao": r"Taxa\s*de\s*liquida[cç][aã]o\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
         "emolumentos": r"Emolumentos\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
@@ -353,9 +355,7 @@ def parse_cost_components(text: str) -> dict:
     # Totais / agregados (padronizados)
     totals_pats = {
         "total_bovespa_soma": r"Total\s*Bovespa\s*/\s*Soma\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        # B3 usa "Total Custos / Despesas"; XP costuma usar "Total Corretagem / Despesas"
         "total_custos_despesas": r"Total\s*(?:Custos|Corretagem)\s*/\s*Despesas\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
-        # Alguns PDFs trazem "Taxas B3" (soma de emolumentos+registro+transf etc.). Usado só como fallback.
         "taxas_b3": r"Taxas?\s*B3\s*[:\-]?\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
     }
     for key, pat in totals_pats.items():
@@ -363,7 +363,7 @@ def parse_cost_components(text: str) -> dict:
         if m:
             components[key] = parse_brl_number(m.group(1))
 
-    # IRRF (para informação; fora do rateio)
+    # IRRF (para info; fora do rateio)
     m_irrf = re.search(r"I\.?R\.?R\.?F\.?.*?(\d{1,3}(?:\.\d{3})*,\d{2})", text, flags=re.IGNORECASE)
     if m_irrf:
         components["_irrf"] = parse_brl_number(m_irrf.group(1))
@@ -372,9 +372,9 @@ def parse_cost_components(text: str) -> dict:
 
 def compute_rateable_total(fees: dict) -> tuple[float, dict]:
     """
-    Calcula o TOTAL para rateio seguindo a regra:
+    TOTAL para rateio:
       Liquidação + Registro + Total Bovespa/Soma + Total Custos/Despesas
-    Se algum total não existir, reconstrói a parcela correspondente via atômicos.
+    Se algum total não existir, reconstrói via atômicos equivalentes.
     Retorna (total, detalhes_usados)
     """
     used = {}
@@ -382,7 +382,7 @@ def compute_rateable_total(fees: dict) -> tuple[float, dict]:
     liq = fees.get("liquidacao", 0.0); used["liquidacao"] = liq
     reg = fees.get("registro", 0.0);   used["registro"] = reg
 
-    # Total Bovespa / Soma: se não existir, reconstrói com emolumentos + transf. de ativos (se houver)
+    # Total Bovespa / Soma
     tb = fees.get("total_bovespa_soma")
     if tb is None:
         tb = (fees.get("emolumentos", 0.0) + fees.get("transf_ativos", 0.0))
@@ -390,10 +390,9 @@ def compute_rateable_total(fees: dict) -> tuple[float, dict]:
     else:
         used["total_bovespa_soma"] = tb
 
-    # Total Custos / Despesas: se não existir, reconstrói com corretagem|taxa_operacional + iss + impostos + outros
+    # Total Custos / Despesas
     tcd = fees.get("total_custos_despesas")
     if tcd is None:
-        # Alguns PDFs usam "corretagem", outros "taxa_operacional"
         base_cor = fees.get("corretagem", 0.0)
         if base_cor == 0.0:
             base_cor = fees.get("taxa_operacional", 0.0)
@@ -410,6 +409,20 @@ def compute_rateable_total(fees: dict) -> tuple[float, dict]:
 # ---------------------------
 # Cotações (yfinance)
 # ---------------------------
+
+def clean_b3_tickers(lst) -> list:
+    """Normaliza e filtra possíveis tickers B3 (inclui FIIs ...11)."""
+    out = []
+    for t in lst:
+        if not isinstance(t, str):
+            continue
+        t = t.strip().upper()
+        if not t:
+            continue
+        # Padrões: FIIs ABCD11, ações PETR4, BDRs AAPL34, ETFs BOVA11, sufixo letra opcional
+        if re.fullmatch(r"[A-Z]{3,6}\d{0,2}[A-Z]?", t):
+            out.append(t)
+    return sorted(set(out))
 
 def guess_yf_symbols_for_b3(ticker: str) -> list:
     if not ticker:
@@ -435,10 +448,12 @@ def _format_dt_local(dt) -> str:
             return str(dt)
 
 def _pick_symbol_with_data(ticker: str) -> tuple[str|None, str]:
+    """Tenta '.SA' primeiro; cai para sem sufixo. Garante histórico diário."""
     if yf is None:
         return None, "yfinance ausente"
+    candidates = [f"{ticker.upper()}.SA", ticker.upper()]
     last_err = ""
-    for sym in guess_yf_symbols_for_b3(ticker):
+    for sym in candidates:
         try:
             hd = yf.Ticker(sym).history(period="10d", interval="1d", auto_adjust=False)
             if not hd.empty and "Close" in hd and not hd["Close"].dropna().empty:
@@ -715,22 +730,31 @@ if mostrar_cotacoes:
                     ref_date = datetime.strptime(data_pregao_str, "%d/%m/%Y")
                 except Exception:
                     ref_date = None
-            tickers = sorted(out["Ativo"].unique().tolist())
-            quotes = fetch_quotes_for_tickers(tickers, ref_date=ref_date)
-            if not quotes.empty:
-                qfmt = quotes.copy()
-                for c in ["Último", "Fechamento (pregão)"]:
-                    qfmt[c] = qfmt[c].map(lambda x: brl(x) if pd.notna(x) else "")
-                st.dataframe(qfmt, use_container_width=True, hide_index=True)
+
+            tickers_raw = out["Ativo"].fillna("").tolist()
+            tickers = clean_b3_tickers(tickers_raw)
+
+            if not tickers:
+                st.info("Nenhum ticker válido detectado para consultar.")
             else:
-                st.info("Não foi possível obter cotações para os tickers detectados.")
+                quotes = fetch_quotes_for_tickers(tickers, ref_date=ref_date)
+                if quotes.empty:
+                    st.warning("Não foi possível obter cotações no momento. Mostrando símbolos e motivos:")
+                    st.dataframe(pd.DataFrame({"Ticker": tickers, "Símbolo": ["" for _ in tickers], "Motivo": ["sem dados" for _ in tickers]}),
+                                 use_container_width=True, hide_index=True)
+                else:
+                    qfmt = quotes.copy()
+                    for c in ["Último", "Fechamento (pregão)"]:
+                        qfmt[c] = qfmt[c].map(lambda x: brl(x) if pd.notna(x) else "")
+                    st.dataframe(qfmt, use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== Debug (Expander) =====
 with st.expander("🛠️ Debug (mostrar/ocultar)"):
-    st.text_area("Texto extraído (parcial)", value=text[:4000], height=240)
+    st.text_area("Texto extraído (primeiros 3000 chars)", value=text[:3000], height=240)
+    st.code("\n".join([f"{i+1:02d}: {l}" for i,l in enumerate(text.splitlines()[:40])]), language="text")
     st.write("Extractor usado:", _extractor_used)
     st.write("Layout detectado:", layout)
     st.write("Fees detectados:", fees)
-    st.write("Cálculo do total (regra padrão):", used_detail)
+    st.write("Cálculo total (regra padrão):", used_detail)
     st.write("Agregado numérico:", out)
