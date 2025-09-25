@@ -1,11 +1,19 @@
+# App/UI
 streamlit>=1.36
-numpy==2.1.3
-pandas==2.3.2
-yfinance==0.2.48
-pdfplumber==0.11.4
-PyPDF2==3.0.1
-Pillow==10.4.0
-# PyMuPDF é opcional; só mantenha se precisar do fallback mais forte de extração
-#PyMuPDF==1.24.10
-pandas>=2.3.2
-numpy>=2.1.3
+
+# Dados
+pandas>=2.2
+
+# PDF parsing (preferencial: pdfplumber; fallbacks: PyPDF2 e PyMuPDF)
+pdfplumber>=0.11
+pdfminer.six>=20221105
+PyPDF2>=3.0.0
+PyMuPDF>=1.24   # se der erro no deploy, comente esta linha (o app funciona sem)
+
+# Cotações
+yfinance>=0.2.52
+requests>=2.31
+
+# Dependências auxiliares
+pillow>=10.0.0
+tzdata>=2024.1
