@@ -1,9 +1,11 @@
 # calcB3.py
 # App Streamlit: múltiplos PDFs B3/XP, rateio por valor, PM, cotações (Yahoo padrão),
 # destaques nas colunas (Data do Pregão, Quantidade, Valor, Total) e "Operação" colorida.
-# Agora com banco SQLite: salvar ingestões, histórico de trades e aba Carteira.
+# Banco SQLite com: salvar ingestões, histórico de trades, export/import do DB,
+# visão mestre por ativo com drill-down de movimentações, botões "+" e deduplicação confirmada.
 
 import io
+import os
 import re
 import math
 import unicodedata
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from time import time as _now
 
 import pandas as pd
 import streamlit as st
@@ -637,6 +640,52 @@ def db_positions_dataframe() -> pd.DataFrame:
             rows.append({"Ativo": t, "Quantidade": d["qty"], "PM": d["avg"], "Custo Atual": d["qty"]*d["avg"]})
     return pd.DataFrame(rows).sort_values("Ativo")
 
+def db_rollup_costs_total_by_ticker() -> pd.DataFrame:
+    """Agrega Custos e Total (somatórios) a partir de trades_agg, por ticker."""
+    conn = db_connect()
+    df = pd.read_sql_query("""
+        SELECT ativo AS Ativo,
+               COALESCE(SUM(custos),0.0) AS Custos,
+               COALESCE(SUM(total),0.0)  AS Total
+        FROM trades_agg
+        WHERE ativo <> ''
+        GROUP BY ativo
+    """, conn)
+    conn.close()
+    return df
+
+def db_movements_for_ticker(ticker: str) -> pd.DataFrame:
+    """Movimentações agregadas por data/operacao (o que você vê nas notas) para um ticker."""
+    conn = db_connect()
+    df = pd.read_sql_query("""
+        SELECT data_pregao AS "Data do Pregão",
+               operacao    AS "Operação",
+               quantidade  AS "Quantidade",
+               valor       AS "Valor",
+               preco_medio AS "Preço Médio",
+               custos      AS "Custos",
+               total       AS "Total"
+        FROM trades_agg
+        WHERE ativo = ?
+        ORDER BY date(substr(data_pregao,7,4)||'-'||substr(data_pregao,4,2)||'-'||substr(data_pregao,1,2)) ASC,
+                 CASE WHEN operacao='Compra' THEN 0 ELSE 1 END
+    """, conn, params=(ticker,))
+    conn.close()
+    return df
+
+def db_export_bytes() -> bytes | None:
+    try:
+        return Path(DB_PATH).read_bytes() if Path(DB_PATH).exists() else None
+    except Exception:
+        return None
+
+def db_import_replace(db_bytes: bytes) -> bool:
+    try:
+        Path(DB_PATH).write_bytes(db_bytes)
+        return True
+    except Exception:
+        return False
+
 
 # =============================================================================
 # Processamento de uma nota
@@ -785,6 +834,26 @@ with st.sidebar:
     fonte = st.radio("Fonte das cotações", ["Yahoo Finance","Google Finance"], index=0)
     if st.button("🔄 Atualizar cotações", use_container_width=True):
         st.cache_data.clear(); st.rerun()
+
+    st.markdown("---")
+    st.subheader("Banco de dados")
+    try:
+        st.caption(f"Arquivo DB: `{DB_PATH.resolve()}`")
+    except Exception:
+        st.caption("Arquivo DB: carteira.db")
+    db_bytes = db_export_bytes()
+    if db_bytes:
+        st.download_button("⬇️ Exportar DB (carteira.db)", data=db_bytes, file_name="carteira.db", mime="application/octet-stream", use_container_width=True)
+    db_up = st.file_uploader("⬆️ Importar/Substituir DB (.db)", type=["db","sqlite"], key="db_upload")
+    if db_up and st.button("Substituir banco atual", use_container_width=True):
+        ok = db_import_replace(db_up.read())
+        if ok:
+            st.success("Banco substituído com sucesso.")
+            st.cache_data.clear()
+            st.rerun()
+        else:
+            st.error("Falha ao substituir o banco.")
+
     st.markdown("---")
     st.subheader("Mapeamento opcional Nome→Ticker")
     st.write("Se a nota usa **nome da empresa** em vez do ticker, forneça um CSV `Nome,Ticker`.")
@@ -844,15 +913,22 @@ for idx, res in enumerate(results, start=1):
             st.download_button("Baixar CSV (nota)", data=csv_bytes, file_name=f"resultado_{res['filename']}.csv", mime="text/csv")
             st.markdown('</div>', unsafe_allow_html=True)
 
-        # --- salvar esta nota no banco ---
+        # --- botão "+" (adicionar ao banco) com deduplicação/confirm ---
         with st.container():
             col_s1, col_s2 = st.columns([1,3])
             with col_s1:
-                if st.button(f"💾 Salvar no banco ({res['filename']})", key=f"save_{res['filehash']}"):
+                key_add = f"add_{res['filehash']}"
+                if st.button(f"➕ Adicionar ao banco", key=key_add):
                     if db_already_ingested(res["filehash"]):
-                        st.warning("Este PDF já foi salvo (deduplicado por filehash).")
+                        st.warning("Esta nota já existe no banco (mesmo filehash).")
+                        st.info("Se quiser duplicar mesmo assim, clique abaixo.")
+                        if st.button("✅ Salvar duplicado mesmo assim", key=f"dup_{res['filehash']}"):
+                            tickers_note = clean_b3_tickers(res["out"]["Ativo"].astype(str).tolist())
+                            quotes_note = fetch_quotes_yahoo_for_tickers(tickers_note) if tickers_note else None
+                            filehash_dup = f"{res['filehash']}:dup:{int(_now())}"
+                            db_save_ingestion(res, filehash_dup, res["filename"], quotes_note)
+                            st.success("Duplicado salvo no banco!")
                     else:
-                        # snapshot de cotações desta nota (Yahoo)
                         tickers_note = clean_b3_tickers(res["out"]["Ativo"].astype(str).tolist())
                         quotes_note = fetch_quotes_yahoo_for_tickers(tickers_note) if tickers_note else None
                         db_save_ingestion(res, res["filehash"], res["filename"], quotes_note)
@@ -887,7 +963,29 @@ with tabs[0]:
         st.download_button("Baixar CSV (consolidado)", data=csv_cons, file_name="resultado_consolidado.csv", mime="text/csv")
         st.markdown('</div>', unsafe_allow_html=True)
 
-# Cotações (padrão Yahoo)
+        # botão "+" para adicionar TODAS
+        st.markdown("#### ➕ Adicionar TODAS as notas carregadas ao banco")
+        allow_dups = st.checkbox("Permitir duplicados", value=False, help="Se marcado, notas já existentes serão salvas com sufixo de duplicata.")
+        if st.button("➕ Adicionar todas"):
+            inserted = 0; duplicated = 0
+            for r in results:
+                if not r.get("ok"): continue
+                fh = r["filehash"]
+                if db_already_ingested(fh) and not allow_dups:
+                    duplicated += 1
+                    continue
+                tickers_note = clean_b3_tickers(r["out"]["Ativo"].astype(str).tolist())
+                quotes_note = fetch_quotes_yahoo_for_tickers(tickers_note) if tickers_note else None
+                if db_already_ingested(fh) and allow_dups:
+                    fh = f"{fh}:dup:{int(_now())}"
+                db_save_ingestion(r, fh, r["filename"], quotes_note)
+                inserted += 1
+            if inserted:
+                st.success(f"{inserted} nota(s) adicionada(s) ao banco.")
+            if duplicated and not allow_dups:
+                st.warning(f"{duplicated} nota(s) já existiam e foram ignoradas. Marque 'Permitir duplicados' para forçar.")
+
+# Cotações (padrão Yahoo ou Google)
 if mostrar_cotacoes:
     st.markdown('<div class="section-title">💹 Cotações</div>', unsafe_allow_html=True)
     with st.container():
@@ -925,25 +1023,56 @@ if mostrar_cotacoes:
 # Aba Banco/Carteira
 with tabs[-1]:
     st.markdown("### 📦 Banco / Carteira")
+
+    # Visão mestre por ativo (posição + custos e total acumulados)
     df_pos = db_positions_dataframe()
-    if df_pos.empty:
-        st.info("Nenhuma posição. Salve notas no banco para montar sua carteira.")
+    df_ct = db_rollup_costs_total_by_ticker()
+    if df_pos.empty and df_ct.empty:
+        st.info("Nenhuma posição. Use os botões ➕ para salvar notas no banco.")
     else:
+        # Merge por ativo
+        df_master = pd.merge(df_pos, df_ct, on="Ativo", how="outer").fillna({"Quantidade":0,"PM":0.0,"Custo Atual":0.0,"Custos":0.0,"Total":0.0})
+        df_master = df_master.sort_values("Ativo")
+
+        colL, colR = st.columns([2,1])
+        with colL:
+            st.markdown("#### Ativos (mestre)")
+            st.dataframe(
+                df_master[["Ativo","Quantidade","PM","Custos","Total"]],
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Quantidade": st.column_config.NumberColumn(format="%.0f"),
+                    "PM": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Custos": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Total": st.column_config.NumberColumn(format="R$ %.2f"),
+                }
+            )
+            st.caption("Quantidade e PM são posição líquida (método médio móvel). Custos/Total são somatórios das negociações no histórico.")
+
+        with colR:
+            st.markdown("#### 🔎 Movimentações do ticker")
+            choices = sorted(df_master["Ativo"].dropna().astype(str).unique().tolist())
+            pick = st.selectbox("Escolha o ativo", choices, index=0 if choices else None)
+            if pick:
+                df_mov = db_movements_for_ticker(pick)
+                if df_mov.empty:
+                    st.info("Sem movimentações para este ticker.")
+                else:
+                    render_result_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+
+    # Opcional: resumo de marcação a mercado usando df_pos + cotações
+    st.markdown("#### Marcação a mercado (rápido)")
+    if not (df_pos is None or df_pos.empty):
         tickers_all = clean_b3_tickers(df_pos["Ativo"].tolist())
         qdf = fetch_quotes_yahoo_for_tickers(tickers_all) if tickers_all else pd.DataFrame()
         last_map = {r["Ticker"]: r["Último"] for _, r in qdf.iterrows()} if not qdf.empty else {}
-        df_pos["Último"] = df_pos["Ativo"].map(last_map)
-        df_pos["Patrimônio"] = df_pos.apply(
-            lambda r: (r["Quantidade"] * r["Último"]) if pd.notna(r["Último"]) else None, axis=1
-        )
-        df_pos["P&L Não Real."] = df_pos.apply(
-            lambda r: (r["Patrimônio"] - r["Custo Atual"]) if pd.notna(r["Patrimônio"]) else None, axis=1
-        )
-
+        df_mv = df_pos.copy()
+        df_mv["Último"] = df_mv["Ativo"].map(last_map)
+        df_mv["Patrimônio"] = df_mv.apply(lambda r: (r["Quantidade"] * r["Último"]) if pd.notna(r["Último"]) else None, axis=1)
+        df_mv["P&L Não Real."] = df_mv.apply(lambda r: (r["Patrimônio"] - r["Custo Atual"]) if pd.notna(r["Patrimônio"]) else None, axis=1)
         st.dataframe(
-            df_pos[["Ativo","Quantidade","PM","Custo Atual","Último","Patrimônio","P&L Não Real."]],
-            use_container_width=True,
-            hide_index=True,
+            df_mv[["Ativo","Quantidade","PM","Custo Atual","Último","Patrimônio","P&L Não Real."]],
+            use_container_width=True, hide_index=True,
             column_config={
                 "Quantidade": st.column_config.NumberColumn(format="%.0f"),
                 "PM": st.column_config.NumberColumn(format="R$ %.2f"),
@@ -953,7 +1082,7 @@ with tabs[-1]:
                 "P&L Não Real.": st.column_config.NumberColumn(format="R$ %.2f"),
             }
         )
-
-        total_patr = df_pos["Patrimônio"].sum(skipna=True) if "Patrimônio" in df_pos else 0.0
-        total_custo = df_pos["Custo Atual"].sum(skipna=True) if "Custo Atual" in df_pos else 0.0
+        total_patr = df_mv["Patrimônio"].sum(skipna=True) if "Patrimônio" in df_mv else 0.0
+        total_custo = df_mv["Custo Atual"].sum(skipna=True) if "Custo Atual" in df_mv else 0.0
         st.caption(f"Total investido: **R$ {brl(total_custo)}** • Patrimônio marcado a mercado: **R$ {brl(total_patr)}**")
+
