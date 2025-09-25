@@ -1,12 +1,15 @@
 # calcB3.py
 # App Streamlit: múltiplos PDFs B3/XP, rateio por valor, PM, cotações (Yahoo padrão),
-# colunas destacadas (Data do Pregão, Quantidade, Valor, Total) e "Operação" colorida.
+# destaques nas colunas (Data do Pregão, Quantidade, Valor, Total) e "Operação" colorida.
+# Agora com banco SQLite: salvar ingestões, histórico de trades e aba Carteira.
 
 import io
 import re
 import math
 import unicodedata
 import hashlib
+import sqlite3
+from pathlib import Path
 from typing import Any
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -333,7 +336,7 @@ def compute_rateable_total(fees: dict) -> tuple[float, dict]:
 
 
 # =============================================================================
-# Quotes (Yahoo padrão)
+# Quotes (Yahoo padrão + Google opcional)
 # =============================================================================
 def guess_yf_symbols_for_b3(ticker: str) -> list:
     return [f"{ticker.upper()}.SA", ticker.upper()]
@@ -465,6 +468,177 @@ def fetch_quotes_google_for_tickers(tickers: list) -> pd.DataFrame:
 
 
 # =============================================================================
+# DB (SQLite)
+# =============================================================================
+DB_PATH = Path("carteira.db")
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+def db_init():
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS ingestions (
+        filehash TEXT PRIMARY KEY,
+        filename TEXT,
+        layout   TEXT,
+        data_pregao TEXT,
+        liquido_para_data TEXT,
+        liquido_para_valor REAL,
+        extractor TEXT,
+        total_rateio REAL,
+        created_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS trades_raw (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filehash TEXT,
+        data_pregao TEXT,
+        ativo TEXT,
+        operacao TEXT,
+        quantidade INTEGER,
+        preco_unit REAL,
+        valor REAL,
+        sinal_dc TEXT,
+        nome TEXT,
+        FOREIGN KEY(filehash) REFERENCES ingestions(filehash) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS trades_agg (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filehash TEXT,
+        data_pregao TEXT,
+        ativo TEXT,
+        operacao TEXT,
+        quantidade INTEGER,
+        valor REAL,
+        preco_medio REAL,
+        custos REAL,
+        total REAL,
+        FOREIGN KEY(filehash) REFERENCES ingestions(filehash) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS fees_components (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filehash TEXT,
+        key TEXT,
+        value REAL,
+        FOREIGN KEY(filehash) REFERENCES ingestions(filehash) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS quotes_snap (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filehash TEXT,
+        ticker TEXT,
+        last REAL,
+        last_when TEXT,
+        close REAL,
+        close_date TEXT,
+        source TEXT,
+        FOREIGN KEY(filehash) REFERENCES ingestions(filehash) ON DELETE CASCADE
+    );
+    """)
+    conn.commit()
+    conn.close()
+
+def db_already_ingested(filehash: str) -> bool:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM ingestions WHERE filehash = ?", (filehash,))
+    ok = cur.fetchone() is not None
+    conn.close()
+    return ok
+
+def db_save_ingestion(res: dict, filehash: str, filename: str, quotes_df: pd.DataFrame | None = None):
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO ingestions
+        (filehash, filename, layout, data_pregao, liquido_para_data, liquido_para_valor, extractor, total_rateio, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+    """, (
+        filehash, filename, res.get("layout"), res.get("data_pregao"), res.get("liquido_para_data"),
+        parse_brl_number(res["liquido_para_valor"]) if res.get("liquido_para_valor") else None,
+        res.get("extractor"), res.get("total_rateio"), datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    ))
+    fees = res.get("fees") or {}
+    for k, v in fees.items():
+        if k.startswith("_"): 
+            continue
+        cur.execute("INSERT INTO fees_components (filehash, key, value) VALUES (?,?,?)", (filehash, k, float(v)))
+    df_raw = res.get("df_valid")
+    if df_raw is not None and not df_raw.empty:
+        for _, r in df_raw.iterrows():
+            cur.execute("""
+                INSERT INTO trades_raw (filehash, data_pregao, ativo, operacao, quantidade, preco_unit, valor, sinal_dc, nome)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                filehash, res.get("data_pregao"), str(r.get("Ativo") or ""), str(r.get("Operação") or ""),
+                int(r.get("Quantidade") or 0), float(r.get("Preço_Unitário") or 0.0),
+                float(r.get("Valor") or 0.0), str(r.get("Sinal_DC") or ""), str(r.get("Nome") or "")
+            ))
+    df_out = res.get("out")
+    if df_out is not None and not df_out.empty:
+        for _, r in df_out.iterrows():
+            cur.execute("""
+                INSERT INTO trades_agg (filehash, data_pregao, ativo, operacao, quantidade, valor, preco_medio, custos, total)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                filehash, r["Data do Pregão"], r["Ativo"], r["Operação"],
+                int(r["Quantidade"]), float(r["Valor"]), 
+                float(r["Preço Médio"]) if pd.notna(r["Preço Médio"]) else None,
+                float(r["Custos"]), float(r["Total"])
+            ))
+    if quotes_df is not None and not quotes_df.empty:
+        for _, r in quotes_df.iterrows():
+            cur.execute("""
+                INSERT INTO quotes_snap (filehash, ticker, last, last_when, close, close_date, source)
+                VALUES (?,?,?,?,?,?,?)
+            """, (
+                filehash, r.get("Ticker"), 
+                float(r.get("Último")) if pd.notna(r.get("Último")) else None,
+                r.get("Último (quando)"), 
+                float(r.get("Fechamento (pregão)")) if pd.notna(r.get("Fechamento (pregão)")) else None,
+                r.get("Pregão (data)"), "Yahoo"
+            ))
+    conn.commit(); conn.close()
+
+def db_positions_dataframe() -> pd.DataFrame:
+    """Calcula posição e PM (médio móvel Brasil) a partir de trades_raw."""
+    conn = db_connect()
+    df = pd.read_sql_query("""
+        SELECT id, data_pregao, ativo, operacao, quantidade, valor
+        FROM trades_raw
+        WHERE ativo <> ''
+        ORDER BY date(substr(data_pregao,7,4)||'-'||substr(data_pregao,4,2)||'-'||substr(data_pregao,1,2)) ASC, id ASC
+    """, conn)
+    conn.close()
+    if df.empty: 
+        return pd.DataFrame(columns=["Ativo","Quantidade","PM","Custo Atual"])
+
+    pos = {}
+    for _, r in df.iterrows():
+        t = (r["ativo"] or "").upper().strip()
+        q = int(r["quantidade"] or 0)
+        gross = float(r["valor"] or 0.0)
+        side = "C" if (gross > 0 or str(r["operacao"]).lower()=="compra") else "V"
+        d = pos.get(t, {"qty":0, "avg":0.0})
+        if side == "C":
+            new_qty = d["qty"] + q
+            new_avg = (d["avg"]*d["qty"] + abs(gross)) / new_qty if new_qty else 0.0
+            d["qty"], d["avg"] = new_qty, new_avg
+        else:  # venda: reduz quantidade; PM não muda
+            d["qty"] = d["qty"] - q
+            if d["qty"] <= 0:
+                d["qty"], d["avg"] = 0, 0.0
+        pos[t] = d
+
+    rows = []
+    for t, d in sorted(pos.items()):
+        if d["qty"] != 0:
+            rows.append({"Ativo": t, "Quantidade": d["qty"], "PM": d["avg"], "Custo Atual": d["qty"]*d["avg"]})
+    return pd.DataFrame(rows).sort_values("Ativo")
+
+
+# =============================================================================
 # Processamento de uma nota
 # =============================================================================
 def allocate_with_roundfix(amounts: pd.Series, total_costs: float) -> pd.Series:
@@ -557,13 +731,12 @@ def style_result_df(df: pd.DataFrame) -> Any:
     if "Operação" in df.columns:
         sty = sty.applymap(op_style, subset=["Operação"])
 
-    # Destaque de colunas (borda esquerda/direita + fundo + negrito)
+    # Destaque de colunas
     if cols_emphasis:
         sty = sty.set_properties(
             subset=cols_emphasis,
             **{"border-left":"1px solid #e5e7eb","border-right":"1px solid #e5e7eb","background-color":"#f6f7f9","font-weight":"700"}
         )
-        # Cabeçalhos dessas colunas
         table_styles = []
         for c in cols_emphasis:
             idx = df.columns.get_loc(c)
@@ -573,7 +746,6 @@ def style_result_df(df: pd.DataFrame) -> Any:
             })
         sty = sty.set_table_styles(table_styles, overwrite=False)
 
-    # Borda geral suave
     sty = sty.set_properties(**{"border":"1px solid #e5e7eb"})
     return sty
 
@@ -589,6 +761,8 @@ def render_result_table(df: pd.DataFrame):
 # APP
 # =============================================================================
 st.set_page_config(page_title="Calc B3 - Nota de Corretagem", layout="wide")
+db_init()  # inicializa o banco
+
 st.markdown("""
 <style>
 .big-title { font-size: 2rem; font-weight: 700; margin-bottom: .25rem; }
@@ -636,15 +810,16 @@ for f in uploads:
     try:
         pdf_bytes = f.read()
         res = process_one_pdf(pdf_bytes, default_map)
-        res["filename"] = f.name; res["filehash"] = sha1(pdf_bytes)
+        res["filename"] = f.name
+        res["filehash"] = sha1(pdf_bytes)
     except Exception as e:
-        res = {"ok": False, "error": str(e), "filename": f.name}
+        res = {"ok": False, "error": str(e), "filename": f.name, "filehash": "NA"}
     results.append(res)
 
-tab_titles = ["Consolidado"] + [r.get("filename", f"Arquivo {i+1}") for i, r in enumerate(results)]
+tab_titles = ["Consolidado"] + [r.get("filename", f"Arquivo {i+1}") for i, r in enumerate(results)] + ["📦 Banco/Carteira"]
 tabs = st.tabs(tab_titles)
 
-# Abas individuais
+# Abas individuais (uma por PDF)
 for idx, res in enumerate(results, start=1):
     with tabs[idx]:
         st.markdown(f"### 📄 {res.get('filename','Arquivo')}")
@@ -668,6 +843,20 @@ for idx, res in enumerate(results, start=1):
             csv_bytes = res["out"].to_csv(index=False).encode("utf-8-sig")
             st.download_button("Baixar CSV (nota)", data=csv_bytes, file_name=f"resultado_{res['filename']}.csv", mime="text/csv")
             st.markdown('</div>', unsafe_allow_html=True)
+
+        # --- salvar esta nota no banco ---
+        with st.container():
+            col_s1, col_s2 = st.columns([1,3])
+            with col_s1:
+                if st.button(f"💾 Salvar no banco ({res['filename']})", key=f"save_{res['filehash']}"):
+                    if db_already_ingested(res["filehash"]):
+                        st.warning("Este PDF já foi salvo (deduplicado por filehash).")
+                    else:
+                        # snapshot de cotações desta nota (Yahoo)
+                        tickers_note = clean_b3_tickers(res["out"]["Ativo"].astype(str).tolist())
+                        quotes_note = fetch_quotes_yahoo_for_tickers(tickers_note) if tickers_note else None
+                        db_save_ingestion(res, res["filehash"], res["filename"], quotes_note)
+                        st.success("Salvo no banco!")
 
         with st.expander("🛠️ Debug (mostrar/ocultar)"):
             text = res.get("text","")
@@ -732,3 +921,39 @@ if mostrar_cotacoes:
                     qfmt = dfq.copy(); qfmt["Último"] = qfmt["Último"].map(lambda x: brl(x) if pd.notna(x) else "")
                     st.dataframe(qfmt, use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
+
+# Aba Banco/Carteira
+with tabs[-1]:
+    st.markdown("### 📦 Banco / Carteira")
+    df_pos = db_positions_dataframe()
+    if df_pos.empty:
+        st.info("Nenhuma posição. Salve notas no banco para montar sua carteira.")
+    else:
+        tickers_all = clean_b3_tickers(df_pos["Ativo"].tolist())
+        qdf = fetch_quotes_yahoo_for_tickers(tickers_all) if tickers_all else pd.DataFrame()
+        last_map = {r["Ticker"]: r["Último"] for _, r in qdf.iterrows()} if not qdf.empty else {}
+        df_pos["Último"] = df_pos["Ativo"].map(last_map)
+        df_pos["Patrimônio"] = df_pos.apply(
+            lambda r: (r["Quantidade"] * r["Último"]) if pd.notna(r["Último"]) else None, axis=1
+        )
+        df_pos["P&L Não Real."] = df_pos.apply(
+            lambda r: (r["Patrimônio"] - r["Custo Atual"]) if pd.notna(r["Patrimônio"]) else None, axis=1
+        )
+
+        st.dataframe(
+            df_pos[["Ativo","Quantidade","PM","Custo Atual","Último","Patrimônio","P&L Não Real."]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Quantidade": st.column_config.NumberColumn(format="%.0f"),
+                "PM": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Custo Atual": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Último": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Patrimônio": st.column_config.NumberColumn(format="R$ %.2f"),
+                "P&L Não Real.": st.column_config.NumberColumn(format="R$ %.2f"),
+            }
+        )
+
+        total_patr = df_pos["Patrimônio"].sum(skipna=True) if "Patrimônio" in df_pos else 0.0
+        total_custo = df_pos["Custo Atual"].sum(skipna=True) if "Custo Atual" in df_pos else 0.0
+        st.caption(f"Total investido: **R$ {brl(total_custo)}** • Patrimônio marcado a mercado: **R$ {brl(total_patr)}**")
