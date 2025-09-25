@@ -791,14 +791,13 @@ def render_table(df: pd.DataFrame):
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
-    """Renderiza a 'tabela' de carteira com o Ticker clicável:
-       - Se st.popover existir, o label do popover é o ticker e abre sobreposto.
-       - Fallback: botão que abre st.modal (sem navegar).
+    """Renderiza a 'tabela' de carteira com o Ticker clicável e CENTRALIZADO
+       na coluna Ativo: usa uma sub-grid [1,2,1] e coloca o trigger no meio.
     """
     widths = [1.4, 1.0, 1.0, 1.0, 1.0, 1.2]
     headers = ["Ativo","Quantidade","PM","Cotação","Total","Patrimônio"]
 
-    # Cabeçalho
+    # Cabeçalho centralizado
     cols = st.columns(widths, vertical_alignment="center")
     for c, h in zip(cols, headers):
         c.markdown(f"<div style='text-align:center;font-weight:700'>{h}</div>", unsafe_allow_html=True)
@@ -813,27 +812,30 @@ def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
         tot = r.get("Total")
         pat = r.get("Patrimônio")
 
-        # Coluna 0: ticker clicável / TOTAL estático
+        # Coluna 0: ticker centralizado
         with cols[0]:
-            if tkr == "TOTAL":
-                st.markdown("<div style='text-align:center;font-weight:700'>TOTAL</div>", unsafe_allow_html=True)
-            else:
-                if hasattr(st, "popover"):
-                    with st.popover(tkr):
-                        df_mov = db_movements_for_ticker(tkr, as_of=as_of_str)
-                        if df_mov.empty:
-                            st.info("Sem movimentações para este ticker no período.")
-                        else:
-                            render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+            left, mid, right = st.columns([1, 2, 1])  # sub-grid para centralizar
+            with mid:
+                if tkr == "TOTAL":
+                    st.markdown("<div style='text-align:center;font-weight:700'>TOTAL</div>", unsafe_allow_html=True)
                 else:
-                    if st.button(tkr, key=f"btn_{tkr}_{i}"):
-                        st.session_state["open_modal_tkr"] = tkr
+                    if hasattr(st, "popover"):
+                        # trigger do popover centralizado
+                        with st.popover(tkr, use_container_width=True):
+                            df_mov = db_movements_for_ticker(tkr, as_of=as_of_str)
+                            if df_mov.empty:
+                                st.info("Sem movimentações para este ticker no período.")
+                            else:
+                                render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+                    else:
+                        # fallback: botão centralizado que abre modal
+                        if st.button(tkr, key=f"btn_{tkr}_{i}", use_container_width=True):
+                            st.session_state["open_modal_tkr"] = tkr
 
         # Demais colunas (centralizadas)
-        def _num(x, money=False, zero_empty=False):
+        def _num(x, money=False):
             if pd.isna(x): return ""
-            if money: return f"R$ {brl(float(x))}"
-            return f"{int(x):d}" if not money else x
+            return f"R$ {brl(float(x))}" if money else f"{int(x):d}"
 
         cols[1].markdown(f"<div style='text-align:center'>{_num(qtd)}</div>", unsafe_allow_html=True)
         cols[2].markdown(f"<div style='text-align:center'>{_num(pm, money=True)}</div>", unsafe_allow_html=True)
@@ -841,7 +843,7 @@ def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
         cols[4].markdown(f"<div style='text-align:center'>{_num(tot, money=True)}</div>", unsafe_allow_html=True)
         cols[5].markdown(f"<div style='text-align:center'>{_num(pat, money=True)}</div>", unsafe_allow_html=True)
 
-    # Fallback modal (se botão foi usado por ausência de popover)
+    # Fallback modal (se não houver popover)
     if not hasattr(st, "popover") and st.session_state.get("open_modal_tkr"):
         tkr = st.session_state["open_modal_tkr"]
         if hasattr(st, "modal"):
@@ -854,7 +856,6 @@ def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
                 if st.button("Fechar"):
                     st.session_state.pop("open_modal_tkr", None)
         else:
-            # fallback extremo: card abaixo
             st.markdown('<div class="card">', unsafe_allow_html=True)
             st.markdown(f"#### Movimentações — {tkr}")
             df_mov = db_movements_for_ticker(tkr, as_of=as_of_str)
