@@ -14,9 +14,14 @@ from typing import Any
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from time import time as _now
-
 import pandas as pd
 import streamlit as st
+
+# --- Tabela interativa (click na linha)
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+except Exception:
+    AgGrid = None
 
 # --- Auto refresh invisível (30s) ---
 try:
