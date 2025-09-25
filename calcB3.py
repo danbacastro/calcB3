@@ -22,7 +22,8 @@ import streamlit as st
 try:
     from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
 except Exception:
-    st_autorefresh = None
+    AUTO_REFRESH_MS = 30_000  # 30 segundos
+    st_autorefresh(interval=AUTO_REFRESH_MS, limit=None, key="auto_refresh_30s")
 
 # --- PDF parsers
 try:
