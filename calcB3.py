@@ -1,7 +1,7 @@
 # calcB3.py
 # App Streamlit: múltiplos PDFs B3/XP, rateio por valor, PM, cotações (Yahoo),
 # Banco/Carteira com posições; TOTAL descontando vendas; pop-up de movimentações;
-# tabelas centralizadas e auto-atualização de cotações.
+# tabelas centralizadas e auto-atualização de cotações (30s invisível).
 
 import io
 import re
@@ -14,14 +14,9 @@ from typing import Any
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from time import time as _now
+
 import pandas as pd
 import streamlit as st
-
-# --- Tabela interativa (click na linha)
-try:
-    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
-except Exception:
-    AgGrid = None
 
 # --- Auto refresh invisível (30s) ---
 try:
@@ -30,7 +25,6 @@ except Exception:
     st_autorefresh = None
 
 AUTO_REFRESH_MS = 30_000  # 30s
-
 if st_autorefresh:
     st_autorefresh(interval=AUTO_REFRESH_MS, limit=None, key="auto_refresh_30s")
 
@@ -89,6 +83,53 @@ def _fmt_dt_local(dt) -> str:
             return pd.to_datetime(dt, utc=True).tz_convert(TZ).strftime("%d/%m/%Y %H:%M")
         except Exception:
             return str(dt)
+
+# Helpers para query params (usar links clicáveis na tabela)
+def _get_qp(name: str, default: str | None = None) -> str | None:
+    try:
+        val = st.query_params.get(name)
+        if isinstance(val, list):
+            return val[0] if val else default
+        return val if val is not None else default
+    except Exception:
+        qp = st.experimental_get_query_params()
+        return (qp.get(name, [default]) or [default])[0]
+
+def _set_qp(**kwargs):
+    try:
+        # Atualiza preservando demais params
+        current = dict(st.query_params)
+        current.update({k: v for k, v in kwargs.items() if v is not None})
+        # remove chaves com None
+        for k, v in list(current.items()):
+            if v is None and k in current:
+                del current[k]
+        st.query_params.clear()
+        st.query_params.update(current)
+    except Exception:
+        current = st.experimental_get_query_params()
+        for k, v in kwargs.items():
+            if v is None:
+                current.pop(k, None)
+            else:
+                current[k] = v
+        st.experimental_set_query_params(**current)
+
+def _del_qp(*keys):
+    try:
+        changed = False
+        for k in keys:
+            if k in st.query_params:
+                del st.query_params[k]
+                changed = True
+        if changed:
+            # no-op para disparar rerun
+            pass
+    except Exception:
+        curr = st.experimental_get_query_params()
+        for k in keys:
+            curr.pop(k, None)
+        st.experimental_set_query_params(**curr)
 
 # =============================================================================
 # PDF → texto
@@ -433,7 +474,6 @@ def fetch_quotes_yahoo_for_tickers(tickers: list, ref_date: datetime | None = No
             "Pregão (data)": close_dt.date().strftime("%d/%m/%Y") if close_dt else "",
             "Motivo": motivo,
         })
-    # usa _salt para variar assinatura do cache
     _ = _salt
     return pd.DataFrame(rows, columns=cols)
 
@@ -777,7 +817,8 @@ def style_result_df(df: pd.DataFrame) -> Any:
     # Centralizar tudo
     sty = sty.set_properties(**{"text-align":"center"})
     sty = sty.set_table_styles([
-        {"selector":"th", "props":[("text-align","center")]}
+        {"selector":"th", "props":[("text-align","center")]},
+        {"selector":".tkr-link", "props":[("font-weight","700")]}
     ], overwrite=False)
     # Destaque colunas pedidas
     if cols_emphasis:
@@ -805,23 +846,21 @@ def render_table(df: pd.DataFrame):
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 def style_portfolio_df(df: pd.DataFrame) -> Any:
+    # escape=None permite HTML bruto (links clicáveis) na coluna Ativo
     sty = df.style.format({
         "Quantidade": "{:.0f}",
         "PM": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
         "Cotação": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
         "Total": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
         "Patrimônio": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
-    })
-    # centralizar tudo (sem negrito/fundo)
+    }, escape=None)
+    # centralizar tudo
     sty = sty.set_properties(**{"text-align":"center"})
-    sty = sty.set_table_styles([{"selector":"th","props":[("text-align","center")]}], overwrite=False)
-    # leve destaque apenas com borda
-    cols_emphasis = [c for c in ["Quantidade","Total"] if c in df.columns]
-    if cols_emphasis:
-        sty = sty.set_properties(
-            subset=cols_emphasis,
-            **{"border-left":"1px solid #e5e7eb","border-right":"1px solid #e5e7eb"}
-        )
+    sty = sty.set_table_styles([
+        {"selector":"th","props":[("text-align","center")]},
+        {"selector":".tkr-link","props":[("color","#0b5ed7"),("text-decoration","none"),("font-weight","700")]}
+    ], overwrite=False)
+    # borda leve (sem fundo/negrito em Quantidade/Total)
     sty = sty.set_properties(**{"border":"1px solid #e5e7eb"})
     return sty
 
@@ -848,6 +887,7 @@ st.markdown("""
 .badge { display:inline-block; padding:.2rem .6rem; border-radius:999px; font-size:.85rem; font-weight:700; border:1px solid transparent; }
 .badge-b3 { background:#E7F5FF; color:#095BC6; border-color:#B3D7FF; }
 .badge-xp { background:#FFF3BF; color:#8B6A00; border-color:#FFD875; }
+.tkr-link:hover { text-decoration: underline; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -974,9 +1014,6 @@ with colfR:
     data_ate = st.date_input("Data de corte (até)", value=datetime.now(TZ).date())
 data_ate_str = datetime.strftime(datetime.combine(data_ate, datetime.min.time()), "%d/%m/%Y")
 
-# "salt" para invalidar cache das cotações a cada 30s (sincroniza com auto-refresh)
-salt = int(_now() // 30)
-
 # Ativos (posição + cotação + total líquido + patrimônio) + linha TOTAL
 df_pos = db_positions_dataframe(as_of=data_ate_str, filtro_ativo=filtro_txt)
 df_tot = db_rollup_net_total_by_ticker(as_of=data_ate_str, filtro_ativo=filtro_txt)  # TOTAL descontando venda
@@ -984,6 +1021,7 @@ df_master = pd.merge(df_pos, df_tot, on="Ativo", how="outer").fillna({"Quantidad
 df_master = df_master.sort_values("Ativo")
 
 tickers_all = clean_b3_tickers(df_master["Ativo"].tolist())
+salt = int(_now() // 30)  # muda a cada 30s p/ furar cache do fetch_quotes
 quotes_df = fetch_quotes_yahoo_for_tickers(tickers_all, _salt=int(salt)) if tickers_all else pd.DataFrame()
 last_map = {r["Ticker"]: r["Último"] for _, r in quotes_df.iterrows()} if not quotes_df.empty else {}
 
@@ -1002,92 +1040,48 @@ total_row = {
 }
 df_master_tot = pd.concat([df_master, pd.DataFrame([total_row])], ignore_index=True)
 
+# Coluna "Ativo" clicável -> link com query param ?tkr=XXX&asof=YYYY-MM-DD
+asof_iso = _ymd_from_br(data_ate_str) or ""
+def _mk_link(t: str) -> str:
+    if not t or t == "TOTAL": 
+        return t or ""
+    return f'<a href="?tkr={t}&asof={asof_iso}#mov" class="tkr-link">{t}</a>'
+
+df_display = df_master_tot.copy()
+df_display["Ativo"] = df_display["Ativo"].map(_mk_link)
+
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.markdown("#### Ativos")
-render_portfolio(df_master_tot[["Ativo","Quantidade","PM","Cotação","Total","Patrimônio"]])
-st.caption("• Total = compras − vendas (líquido).  • Patrimônio = Quantidade × Cotação (0 quando posição zerada).")
+render_portfolio(df_display[["Ativo","Quantidade","PM","Cotação","Total","Patrimônio"]])
+st.caption("• Clique no ticker para ver as movimentações.  • Total = compras − vendas (líquido).  • Patrimônio = Quantidade × Cotação (0 quando posição zerada).")
 st.markdown('</div>', unsafe_allow_html=True)
 
-# Movimentações via POP-UP ao clicar no ticker (se disponível)
-# Linha TOTAL (Total líquido e Patrimônio) — não somar "Total"
-total_row = {
-    "Ativo":"TOTAL",
-    "Quantidade": df_master["Quantidade"].sum(skipna=True),
-    "PM": None,
-    "Custo Atual": df_master["Custo Atual"].sum(skipna=True),
-    "Total": None,
-    "Cotação": None,
-    "Patrimônio": df_master["Patrimônio"].sum(skipna=True),
-}
-df_master_tot = pd.concat([df_master, pd.DataFrame([total_row])], ignore_index=True)
-
-st.markdown('<div class="card">', unsafe_allow_html=True)
-st.markdown("#### Ativos")
-
-# ====== TABELA CLICÁVEL (AgGrid) ======
-if AgGrid is not None:
-    grid_df = df_master_tot[["Ativo","Quantidade","PM","Cotação","Total","Patrimônio"]].copy()
-
-    gob = GridOptionsBuilder.from_dataframe(grid_df)
-    gob.configure_selection(selection_mode="single", use_checkbox=False)
-    gob.configure_grid_options(suppressRowClickSelection=False)
-    gob.configure_default_column(cellStyle={"textAlign":"center"})
-    # Centraliza cabeçalho também
-    gob.configure_grid_options(headerHeight=36)
-    grid_options = gob.build()
-
-    grid_resp = AgGrid(
-        grid_df,
-        gridOptions=grid_options,
-        update_mode=GridUpdateMode.SELECTION_CHANGED,
-        allow_unsafe_jscode=True,
-        theme="balham",
-        fit_columns_on_grid_load=True,
-        height=360,
-    )
-
-    # Quando o usuário clica numa linha, abrimos o modal com as movimentações
-    sel = grid_resp.get("selected_rows", [])
-    if sel:
-        picked = sel[0].get("Ativo")
-        if picked and picked != "TOTAL":
-            st.session_state["modal_ticker"] = picked
-            st.session_state["show_modal"] = True
-
-    # Modal (pop-up) com as movimentações
-    modal_ticker = st.session_state.get("modal_ticker")
-    show_modal  = st.session_state.get("show_modal", False)
-
-    if modal_ticker and show_modal and hasattr(st, "modal"):
-        with st.modal(f"Movimentações — {modal_ticker}", key="movs_modal"):
-            df_mov = db_movements_for_ticker(modal_ticker, as_of=data_ate_str)
+# Modal acionado pelo query param ?tkr=
+clicked_tkr = _get_qp("tkr")
+if clicked_tkr:
+    if hasattr(st, "modal"):
+        with st.modal(f"Movimentações — {clicked_tkr}"):
+            df_mov = db_movements_for_ticker(clicked_tkr, as_of=data_ate_str)
             if df_mov.empty:
                 st.info("Sem movimentações para este ticker no período.")
             else:
                 render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
-            colm1, colm2 = st.columns([1,3])
-            with colm1:
-                if st.button("Fechar"):
-                    st.session_state["show_modal"] = False
-                    st.rerun()
-    elif sel:
-        # Fallback quando não há st.modal disponível: card abaixo
-        picked = sel[0].get("Ativo")
-        if picked and picked != "TOTAL":
-            st.markdown("---")
-            st.markdown(f"#### Movimentações — {picked}")
-            df_mov = db_movements_for_ticker(picked, as_of=data_ate_str)
-            if df_mov.empty:
-                st.info("Sem movimentações para este ticker no período.")
-            else:
-                render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
-
-else:
-    # Fallback total (sem AgGrid): só renderiza a tabela estática
-    render_portfolio(df_master_tot[["Ativo","Quantidade","PM","Cotação","Total","Patrimônio"]])
-    st.caption("• Clique nas 'chips' acima (ou use o seletor) para ver movimentações.")
-st.caption("• Total = compras − vendas (líquido).  • Patrimônio = Quantidade × Cotação (0 quando posição zerada).")
-st.markdown('</div>', unsafe_allow_html=True)
+            if st.button("Fechar"):
+                _del_qp("tkr", "asof")
+                st.rerun()
+    else:
+        # Fallback: card abaixo
+        st.markdown('<div class="card" id="mov">', unsafe_allow_html=True)
+        st.markdown(f"#### Movimentações — {clicked_tkr}")
+        df_mov = db_movements_for_ticker(clicked_tkr, as_of=data_ate_str)
+        if df_mov.empty:
+            st.info("Sem movimentações para este ticker no período.")
+        else:
+            render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+        if st.button("Fechar"):
+            _del_qp("tkr", "asof")
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
 
 # ================================ Gerenciar banco ============================
 st.markdown("### ⚙️ Gerenciar carteira")
