@@ -677,7 +677,7 @@ for idx, res in enumerate(results, start=1):
 
 # Aba Consolidado (por Data do Pregão + Ativo + Operação)
 with tabs[0]:
-    st.markdown("### 📚 Consolidado (Data do Pregão + Ativo + Operação)")
+    st.markdown("### 📚 Consolidado")
     valid_outs = [r["out"] for r in results if r.get("ok")]
     if not valid_outs:
         st.info("Nenhuma nota válida processada.")
