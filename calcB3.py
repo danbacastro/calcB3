@@ -18,11 +18,15 @@ from time import time as _now
 import pandas as pd
 import streamlit as st
 
-# --- Auto refresh (opcional)
+# --- Auto refresh invisível (30s) ---
 try:
-    from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
+    from streamlit_autorefresh import st_autorefresh
 except Exception:
-    AUTO_REFRESH_MS = 30_000  # 30 segundos
+    st_autorefresh = None
+
+AUTO_REFRESH_MS = 30_000  # 30s
+
+if st_autorefresh:
     st_autorefresh(interval=AUTO_REFRESH_MS, limit=None, key="auto_refresh_30s")
 
 # --- PDF parsers
