@@ -1,11 +1,9 @@
 # calcB3.py
 # App Streamlit: múltiplos PDFs B3/XP, rateio por valor, PM, cotações (Yahoo),
-# Banco/Carteira com posições (Ativos), Movimentações do ticker abaixo,
-# TOTAL de Custos e Patrimônio, filtros, exclusão/undo e edição manual de lançamentos.
-# As notas individuais ficam escondidas em um expander (clicáveis).
+# Banco/Carteira com posições; TOTAL descontando vendas; pop-up de movimentações;
+# tabelas centralizadas e auto-atualização de cotações.
 
 import io
-import os
 import re
 import math
 import unicodedata
@@ -19,6 +17,12 @@ from time import time as _now
 
 import pandas as pd
 import streamlit as st
+
+# --- Auto refresh (opcional)
+try:
+    from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
+except Exception:
+    st_autorefresh = None
 
 # --- PDF parsers
 try:
@@ -39,10 +43,6 @@ try:
     import yfinance as yf
 except Exception:
     yf = None
-try:
-    import requests
-except Exception:
-    requests = None
 
 # =============================================================================
 # Utils
@@ -160,10 +160,11 @@ def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
 # =============================================================================
 # Tickers
 # =============================================================================
-FII_EXACT = re.compile(r"\b([A-Z]{4}11[A-Z]?)\b")
-WITH_11   = re.compile(r"\b([A-Z]{3,6}11[A-Z]?)\b")
-SHARES    = re.compile(r"\b([A-Z]{4}[3456][A-Z]?)\b")
-BDR_2D    = re.compile(r"\b([A-Z]{4}\d{2}[A-Z]?)\b")
+import re as _re
+FII_EXACT = _re.compile(r"\b([A-Z]{4}11[A-Z]?)\b")
+WITH_11   = _re.compile(r"\b([A-Z]{3,6}11[A-Z]?)\b")
+SHARES    = _re.compile(r"\b([A-Z]{4}[3456][A-Z]?)\b")
+BDR_2D    = _re.compile(r"\b([A-Z]{4}\d{2}[A-Z]?)\b")
 
 def extract_ticker_from_text(text: str) -> str | None:
     t = strip_accents(text).upper()
@@ -175,7 +176,7 @@ def extract_ticker_from_text(text: str) -> str | None:
 
 def derive_from_on_pn(text: str) -> str | None:
     t = strip_accents(text).upper()
-    m = re.search(r"\b([A-Z]{3,6})\s+(ON|PN)\b", t)
+    m = _re.search(r"\b([A-Z]{3,6})\s+(ON|PN)\b", t)
     if not m:
         return None
     base, cls = m.group(1), m.group(2)
@@ -184,12 +185,12 @@ def derive_from_on_pn(text: str) -> str | None:
 def clean_b3_tickers(lst) -> list:
     out = []
     for t in lst:
-        if not isinstance(t, str): 
+        if not isinstance(t, str):
             continue
         t = strip_accents(t).upper().strip()
         if not t:
             continue
-        if re.fullmatch(r"[A-Z]{3,6}\d{1,2}[A-Z]?", t):
+        if _re.fullmatch(r"[A-Z]{3,6}\d{1,2}[A-Z]?", t):
             out.append(t)
     return sorted(set(out))
 
@@ -199,7 +200,7 @@ def clean_b3_tickers(lst) -> list:
 def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     lines = text.splitlines()
     trade_lines = [l for l in lines if ("BOVESPA" in l and "VISTA" in l and "@" in l)]
-    pat = re.compile(
+    pat = _re.compile(
         r"BOVESPA\s+(?P<cv>[CV])\s+VISTA\s+(?P<spec>.+?)@\s+(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<dc>[CD])"
     )
     recs = []
@@ -208,14 +209,14 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
         if not m:
             continue
         cv = m.group("cv")
-        spec = re.sub(r"\s+", " ", m.group("spec")).strip()
+        spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
         qty = int(m.group("qty"))
         price = parse_brl_number(m.group("price"))
         value = parse_brl_number(m.group("value"))
         dc = m.group("dc")
         ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
         if not ticker:
-            key = re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
+            key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
             ticker = name_to_ticker_map.get(key)
         if not ticker:
             ticker = derive_from_on_pn(spec) or ""
@@ -228,8 +229,8 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     return pd.DataFrame(recs)
 
 def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
-    lines = [l for l in text.splitlines() if "@" in l and re.search(r"\d{1,3}(?:\.\d{3})*,\d{2}", l)]
-    pat = re.compile(
+    lines = [l for l in text.splitlines() if "@" in l and _re.search(r"\d{1,3}(?:\.\d{3})*,\d{2}", l)]
+    pat = _re.compile(
         r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?(?P<spec>.+?)@\s+(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})"
     )
     recs = []
@@ -239,13 +240,13 @@ def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFr
             continue
         cv_raw = m.group("cv").strip().upper()
         cv = "C" if cv_raw.startswith("C") else "V"
-        spec = re.sub(r"\s+", " ", m.group("spec")).strip()
+        spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
         qty = int(m.group("qty"))
         price = parse_brl_number(m.group("price"))
         value = parse_brl_number(m.group("value"))
         ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
         if not ticker:
-            key = re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
+            key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
             ticker = name_to_ticker_map.get(key)
         if not ticker:
             ticker = derive_from_on_pn(spec) or ""
@@ -282,21 +283,21 @@ def parse_header_dates_and_net(text: str):
     pairs = list(zip(lines, norms))
     data_pregao = None
     for raw, norm in pairs[:200]:
-        if any(re.search(p, norm) for p in [r"data\s*do\s*preg[aã]o", r"data\s*da\s*negocia[cç][aã]o", r"\bnegocia[cç][aã]o\b"]):
-            md = re.search(r"(\d{2}/\d{2}/\d{4})", raw)
+        if any(_re.search(p, norm) for p in [r"data\s*do\s*preg[aã]o", r"data\s*da\s*negocia[cç][aã]o", r"\bnegocia[cç][aã]o\b"]):
+            md = _re.search(r"(\d{2}/\d{2}/\d{4})", raw)
             if md: data_pregao = md.group(1); break
     if not data_pregao:
         for raw, norm in pairs[:120]:
             if any(k in norm for k in ["consulta","referenc","liquido","l\u00edquido"]): continue
-            if re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", raw): continue
-            md = re.search(r"(\d{2}/\d{2}/\d{4})", raw)
+            if _re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", raw): continue
+            md = _re.search(r"(\d{2}/\d{2}/\d{4})", raw)
             if md: data_pregao = md.group(1); break
     liquido_para_data = None; liquido_para_valor = None
     for raw, norm in pairs[::-1]:
         if "liquido para" in norm or "l\u00edquido para" in norm:
-            md = re.search(r"(\d{2}/\d{2}/\d{4})", raw)
+            md = _re.search(r"(\d{2}/\d{2}/\d{4})", raw)
             if md: liquido_para_data = md.group(1)
-            vals = re.findall(r"(\d{1,3}(?:\.\d{3})*,\d{2})", raw)
+            vals = _re.findall(r"(\d{1,3}(?:\.\d{3})*,\d{2})", raw)
             if vals: liquido_para_valor = vals[-1]
             break
     return data_pregao, liquido_para_data, liquido_para_valor
@@ -318,7 +319,7 @@ def parse_cost_components(text: str) -> dict:
         "outros": r"\bOutros\b\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
     }
     for k, p in atom.items():
-        m = re.search(p, text, flags=re.IGNORECASE)
+        m = _re.search(p, text, flags=re.IGNORECASE)
         if m: comp[k] = parse_brl_number(m.group(1))
     totals = {
         "total_bovespa_soma": r"Total\s*Bovespa\s*/\s*Soma\s+(\d{1,3}(?:\.\d{3})*,\d{2})",
@@ -326,9 +327,9 @@ def parse_cost_components(text: str) -> dict:
         "taxas_b3": r"Taxas?\s*B3\s*[:\-]?\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
     }
     for k, p in totals.items():
-        m = re.search(p, text, flags=re.IGNORECASE)
+        m = _re.search(p, text, flags=re.IGNORECASE)
         if m: comp[k] = parse_brl_number(m.group(1))
-    m_irrf = re.search(r"I\.?R\.?R\.?F\.?.*?(\d{1,3}(?:\.\d{3})*,\d{2})", text, flags=re.IGNORECASE)
+    m_irrf = _re.search(r"I\.?R\.?R\.?F\.?.*?(\d{1,3}(?:\.\d{3})*,\d{2})", text, flags=re.IGNORECASE)
     if m_irrf: comp["_irrf"] = parse_brl_number(m_irrf.group(1))
     return comp
 
@@ -353,7 +354,7 @@ def compute_rateable_total(fees: dict) -> tuple[float, dict]:
     return total, used
 
 # =============================================================================
-# Quotes (Yahoo + Google fallback)
+# Quotes (Yahoo)
 # =============================================================================
 def guess_yf_symbols_for_b3(ticker: str) -> list:
     return [f"{ticker.upper()}.SA", ticker.upper()]
@@ -370,8 +371,9 @@ def _pick_symbol_with_data(ticker: str) -> tuple[str|None, str]:
             last_err = str(e)
     return None, ("sem histórico diário" if not last_err else last_err)
 
-@st.cache_data(show_spinner=False, ttl=60)
-def fetch_quotes_yahoo_for_tickers(tickers: list, ref_date: datetime | None = None) -> pd.DataFrame:
+@st.cache_data(show_spinner=False, ttl=30)
+def fetch_quotes_yahoo_for_tickers(tickers: list, ref_date: datetime | None = None, _salt: int = 0) -> pd.DataFrame:
+    # _salt serve para “furar” o cache em auto-refresh
     cols = ["Ticker","Símbolo","Último","Último (quando)","Fechamento (pregão)","Pregão (data)","Motivo"]
     rows = []
     if yf is None or not tickers: return pd.DataFrame(columns=cols)
@@ -421,6 +423,8 @@ def fetch_quotes_yahoo_for_tickers(tickers: list, ref_date: datetime | None = No
             "Pregão (data)": close_dt.date().strftime("%d/%m/%Y") if close_dt else "",
             "Motivo": motivo,
         })
+    # usa _salt para variar assinatura do cache
+    _ = _salt
     return pd.DataFrame(rows, columns=cols)
 
 # =============================================================================
@@ -494,15 +498,12 @@ def db_already_ingested(filehash: str) -> bool:
     return ok
 
 def db_delete_ingestion_with_snapshot(filehash: str) -> dict | None:
-    """Deleta uma ingestão e retorna snapshot para possível undo."""
     conn = db_connect(); cur = conn.cursor()
-    # snapshot
     snap = {"ing": None, "raw": [], "agg": [], "fees": []}
     cur.execute("SELECT * FROM ingestions WHERE filehash=?", (filehash,))
     row = cur.fetchone()
     if not row:
-        conn.close()
-        return None
+        conn.close(); return None
     snap["ing"] = row
     cur.execute("SELECT * FROM trades_raw WHERE filehash=?", (filehash,))
     snap["raw"] = cur.fetchall()
@@ -510,7 +511,6 @@ def db_delete_ingestion_with_snapshot(filehash: str) -> dict | None:
     snap["agg"] = cur.fetchall()
     cur.execute("SELECT * FROM fees_components WHERE filehash=?", (filehash,))
     snap["fees"] = cur.fetchall()
-    # delete (cascade on trades_*)
     cur.execute("DELETE FROM ingestions WHERE filehash=?", (filehash,))
     conn.commit(); conn.close()
     return snap
@@ -519,7 +519,6 @@ def db_restore_ingestion_from_snapshot(snap: dict):
     if not snap or not snap.get("ing"):
         return False
     conn = db_connect(); cur = conn.cursor()
-    # columns layout as created above:
     cur.execute("""
         INSERT INTO ingestions (filehash, filename, layout, data_pregao, liquido_para_data, liquido_para_valor, extractor, total_rateio, created_at)
         VALUES (?,?,?,?,?,?,?,?,?)
@@ -583,16 +582,14 @@ def db_save_ingestion(res: dict, filehash: str, filename: str):
             ))
     conn.commit(); conn.close()
 
-# ---- Views com data de corte e filtro de ativo
-def _ymd_from_br(d: str) -> str:
+def _ymd_from_br(d: str) -> str | None:
     try:
-        # dd/mm/yyyy -> yyyy-mm-dd
         return f"{d[6:10]}-{d[3:5]}-{d[0:2]}"
     except Exception:
         return None
 
 def db_positions_dataframe(as_of: str | None = None, filtro_ativo: str | None = None) -> pd.DataFrame:
-    """Calcula posição e PM até a data (inclusive). 'as_of' em dd/mm/aaaa."""
+    """Posição e PM até a data (inclusive)."""
     conn = db_connect()
     where = " WHERE ativo <> '' "
     params = []
@@ -610,7 +607,7 @@ def db_positions_dataframe(as_of: str | None = None, filtro_ativo: str | None = 
         ORDER BY date(substr(data_pregao,7,4)||'-'||substr(data_pregao,4,2)||'-'||substr(data_pregao,1,2)) ASC, id ASC
     """, conn, params=params)
     conn.close()
-    if df.empty: 
+    if df.empty:
         return pd.DataFrame(columns=["Ativo","Quantidade","PM","Custo Atual"])
     pos = {}
     for _, r in df.iterrows():
@@ -626,7 +623,6 @@ def db_positions_dataframe(as_of: str | None = None, filtro_ativo: str | None = 
         else:
             d["qty"] = d["qty"] - q
             if d["qty"] <= 0:
-                # zera posição; PM zera (mantemos PM por movimento, não na posição zerada)
                 d["qty"], d["avg"] = 0, 0.0
         pos[t] = d
     rows = []
@@ -634,8 +630,8 @@ def db_positions_dataframe(as_of: str | None = None, filtro_ativo: str | None = 
         rows.append({"Ativo": t, "Quantidade": d["qty"], "PM": d["avg"], "Custo Atual": d["qty"]*d["avg"]})
     return pd.DataFrame(rows).sort_values("Ativo")
 
-def db_rollup_costs_total_by_ticker(as_of: str | None = None, filtro_ativo: str | None = None) -> pd.DataFrame:
-    """Somatórios de Custos e Total até a data (inclusive)."""
+def db_rollup_net_total_by_ticker(as_of: str | None = None, filtro_ativo: str | None = None) -> pd.DataFrame:
+    """TOTAL líquido por ticker: compras somam, vendas subtraem."""
     conn = db_connect()
     where = " WHERE ativo <> '' "
     params = []
@@ -648,8 +644,7 @@ def db_rollup_costs_total_by_ticker(as_of: str | None = None, filtro_ativo: str 
         params.append(f"%{filtro_ativo}%")
     df = pd.read_sql_query(f"""
         SELECT ativo AS Ativo,
-               COALESCE(SUM(custos),0.0) AS Custos,
-               COALESCE(SUM(total),0.0)  AS Total
+               COALESCE(SUM(CASE WHEN operacao='Compra' THEN total ELSE -total END),0.0) AS Total
         FROM trades_agg
         {where}
         GROUP BY ativo
@@ -658,7 +653,6 @@ def db_rollup_costs_total_by_ticker(as_of: str | None = None, filtro_ativo: str 
     return df
 
 def db_movements_for_ticker(ticker: str, as_of: str | None = None) -> pd.DataFrame:
-    """Movimentações agregadas até data para um ticker; mantém PM também nas vendas."""
     conn = db_connect()
     where = " WHERE ativo = ? "
     params = [ticker]
@@ -683,7 +677,7 @@ def db_movements_for_ticker(ticker: str, as_of: str | None = None) -> pd.DataFra
     return df
 
 # =============================================================================
-# Processamento de uma nota (uploads)
+# Processamento PDF
 # =============================================================================
 def allocate_with_roundfix(amounts: pd.Series, total_costs: float) -> pd.Series:
     if amounts.sum() <= 0 or total_costs <= 0:
@@ -750,7 +744,7 @@ def process_one_pdf(pdf_bytes: bytes, map_dict: dict):
     }
 
 # =============================================================================
-# UI helpers
+# UI helpers (estilo centralizado)
 # =============================================================================
 def style_result_df(df: pd.DataFrame) -> Any:
     cols_emphasis = [c for c in ["Data do Pregão","Quantidade","Valor","Total"] if c in df.columns]
@@ -761,14 +755,21 @@ def style_result_df(df: pd.DataFrame) -> Any:
         "Custos": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
         "Total": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
     })
+    # Operação colorida
     def op_style(v: Any) -> str:
         if isinstance(v, str):
             s = v.strip().lower()
-            if s == "compra": return "color:#16a34a; font-weight:700"
-            if s == "venda":  return "color:#dc2626; font-weight:700"
-        return ""
+            if s == "compra": return "color:#16a34a; font-weight:700; text-align:center"
+            if s == "venda":  return "color:#dc2626; font-weight:700; text-align:center"
+        return "text-align:center"
     if "Operação" in df.columns:
         sty = sty.applymap(op_style, subset=["Operação"])
+    # Centralizar tudo
+    sty = sty.set_properties(**{"text-align":"center"})
+    sty = sty.set_table_styles([
+        {"selector":"th", "props":[("text-align","center")]}
+    ], overwrite=False)
+    # Destaque colunas pedidas
     if cols_emphasis:
         sty = sty.set_properties(
             subset=cols_emphasis,
@@ -782,12 +783,41 @@ def style_result_df(df: pd.DataFrame) -> Any:
                 "props": [("border","1px solid #e5e7eb"),("background-color","#f6f7f9"),("font-weight","700")]
             })
         sty = sty.set_table_styles(table_styles, overwrite=False)
+    # Borda geral
     sty = sty.set_properties(**{"border":"1px solid #e5e7eb"})
     return sty
 
-def render_result_table(df: pd.DataFrame):
+def render_table(df: pd.DataFrame):
     try:
         html = style_result_df(df).to_html()
+        st.markdown(html, unsafe_allow_html=True)
+    except Exception:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+def style_portfolio_df(df: pd.DataFrame) -> Any:
+    sty = df.style.format({
+        "Quantidade": "{:.0f}",
+        "PM": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
+        "Cotação": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
+        "Total": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
+        "Patrimônio": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
+    })
+    # centralizar tudo
+    sty = sty.set_properties(**{"text-align":"center"})
+    sty = sty.set_table_styles([{"selector":"th","props":[("text-align","center")]}], overwrite=False)
+    # destaque nas colunas Quantidade / Total
+    cols_emphasis = [c for c in ["Quantidade","Total"] if c in df.columns]
+    if cols_emphasis:
+        sty = sty.set_properties(
+            subset=cols_emphasis,
+            **{"border-left":"1px solid #e5e7eb","border-right":"1px solid #e5e7eb","background-color":"#f6f7f9","font-weight":"700"}
+        )
+    sty = sty.set_properties(**{"border":"1px solid #e5e7eb"})
+    return sty
+
+def render_portfolio(df: pd.DataFrame):
+    try:
+        html = style_portfolio_df(df).to_html()
         st.markdown(html, unsafe_allow_html=True)
     except Exception:
         st.dataframe(df, use_container_width=True, hide_index=True)
@@ -812,12 +842,24 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="big-title">Calc B3 – Nota de Corretagem</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Consolidado de notas B3/XP, carteira e movimentações com PM, custos, patrimônio e cotações.</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Consolidado de notas B3/XP, carteira e movimentações com PM, patrimônio e cotações em tempo quase real.</div>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Opções")
-    if st.button("🔄 Recarregar/limpar cache", use_container_width=True):
+    if st.button("🔄 Limpar cache e recarregar", use_container_width=True):
         st.cache_data.clear(); st.rerun()
+
+    st.markdown("---")
+    st.subheader("Cotações")
+    auto_quotes = st.checkbox("Auto-atualizar cotações", value=True)
+    interval_sec = st.number_input("Intervalo (segundos)", min_value=15, value=60, step=5)
+    # contador de autorefresh (se lib estiver instalada). Usado como "sal" do cache.
+    salt = 0
+    if auto_quotes and st_autorefresh is not None:
+        salt = st_autorefresh(interval=interval_sec * 1000, key="auto_quotes_counter") or 0
+    elif auto_quotes:
+        # Fallback: muda o "sal" por minuto para forçar cache diferente, mas sem re-execução automática
+        salt = int(_now() // interval_sec)
 
     st.markdown("---")
     st.subheader("Banco de dados")
@@ -825,11 +867,9 @@ with st.sidebar:
         st.caption(f"Arquivo DB: `{Path('carteira.db').resolve()}`")
     except Exception:
         st.caption("Arquivo DB: carteira.db")
-    # Export
     if Path("carteira.db").exists():
         st.download_button("⬇️ Exportar DB (carteira.db)", data=Path("carteira.db").read_bytes(),
                            file_name="carteira.db", mime="application/octet-stream", use_container_width=True)
-    # Import
     db_up = st.file_uploader("⬆️ Importar/Substituir DB (.db)", type=["db","sqlite"], key="db_upload")
     if db_up and st.button("Substituir banco atual", use_container_width=True):
         try:
@@ -841,7 +881,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Mapeamento opcional Nome→Ticker")
-    st.write("Se a nota usa **nome da empresa** em vez do ticker, forneça um CSV `Nome,Ticker`.")
+    st.write("Forneça um CSV `Nome,Ticker` se sua nota vier sem ticker.")
     map_file = st.file_uploader("Upload CSV de mapeamento (opcional)", type=["csv"], key="map_csv")
 
 default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}
@@ -879,38 +919,33 @@ else:
         st.warning("Nenhuma nota válida processada.")
     else:
         all_out = pd.concat(valid_outs, ignore_index=True)
-        # Filtros rápidos: Compra/Venda, FIIs x Ações
         colf1, colf2, colf3 = st.columns([1,1,2])
         with colf1:
-            fil_compra = st.checkbox("Somente Compras", True)
-            fil_venda  = st.checkbox("Somente Vendas", True)
+            fil_compra = st.checkbox("Compras", True)
+            fil_venda  = st.checkbox("Vendas", True)
         with colf2:
-            apenas_fiis   = st.checkbox("Somente FIIs", False)
-            apenas_acoes  = st.checkbox("Somente Ações", False)
+            apenas_fiis   = st.checkbox("Só FIIs", False)
+            apenas_acoes  = st.checkbox("Só Ações", False)
         with colf3:
             filtro_ticker = st.text_input("Filtro por ticker (contém)", "")
 
         dfc = all_out.copy()
-        if not fil_compra:
-            dfc = dfc[dfc["Operação"] != "Compra"]
-        if not fil_venda:
-            dfc = dfc[dfc["Operação"] != "Venda"]
+        if not fil_compra: dfc = dfc[dfc["Operação"] != "Compra"]
+        if not fil_venda:  dfc = dfc[dfc["Operação"] != "Venda"]
         if apenas_fiis and not apenas_acoes:
             dfc = dfc[dfc["Ativo"].str.contains(r"11[A-Z]?$", regex=True, na=False)]
         if apenas_acoes and not apenas_fiis:
             dfc = dfc[dfc["Ativo"].str.contains(r"[3456][A-Z]?$", regex=True, na=False)]
         if filtro_ticker:
             dfc = dfc[dfc["Ativo"].str.contains(filtro_ticker, case=False, na=False)]
-        # recomputa PM da linha filtrada (defensivo)
         dfc["Preço Médio"] = dfc.apply(lambda r: (abs(r["Valor"])/r["Quantidade"]) if r["Quantidade"] else None, axis=1)
 
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        render_result_table(dfc[["Data do Pregão","Ativo","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+        render_table(dfc[["Data do Pregão","Ativo","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
         csv_cons = dfc.to_csv(index=False).encode("utf-8-sig")
         st.download_button("Baixar consolidado", data=csv_cons, file_name="resultado_consolidado.csv", mime="text/csv")
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ➕ Adicionar ao banco (todas ou selecionar)
         st.markdown("#### ➕ Adicionar PDFs carregados ao banco")
         allow_dups = st.checkbox("Permitir redundância de notas", value=False)
         if st.button("➕ Adicionar todas as notas visíveis"):
@@ -931,30 +966,6 @@ else:
             if duplicated and not allow_dups:
                 st.warning(f"{duplicated} nota(s) já existiam e foram ignoradas.")
 
-# Notas individuais escondidas (opcional)
-if results:
-    with st.expander("🗂️ Notas individuais (opcional)"):
-        for r in results:
-            st.markdown(f"**{r.get('filename','Arquivo')}** — hash `{r.get('filehash')}`")
-            if not r.get("ok"):
-                st.error(r.get("error","Erro ao processar")); 
-                continue
-            layout = r["layout"]; _badge_cls = "badge-xp" if layout=="XP" else "badge-b3"
-            st.markdown(f'<span class="badge {_badge_cls}">{layout}</span> • Extrator: {r["extractor"]}', unsafe_allow_html=True)
-            render_result_table(r["out"][["Data do Pregão","Ativo","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
-            colb1, colb2 = st.columns([1,4])
-            with colb1:
-                if st.button(f"➕ Adicionar esta nota", key=f"add_{r['filehash']}"):
-                    fh = r["filehash"]
-                    if db_already_ingested(fh):
-                        st.warning("Esta nota já existe no banco (mesmo filehash). Clique novamente para salvar duplicado.")
-                        if st.button("✅ Salvar duplicado mesmo assim", key=f"dup_{r['filehash']}"):
-                            db_save_ingestion(r, f"{fh}:dup:{int(_now())}", r["filename"])
-                            st.success("Duplicado salvo.")
-                    else:
-                        db_save_ingestion(r, fh, r["filename"])
-                        st.success("Salvo no banco.")
-
 # ================================ Banco / Carteira ============================
 st.markdown("## 📦 Carteira")
 
@@ -966,26 +977,26 @@ with colfR:
     data_ate = st.date_input("Data de corte (até)", value=datetime.now(TZ).date())
 data_ate_str = datetime.strftime(datetime.combine(data_ate, datetime.min.time()), "%d/%m/%Y")
 
-# Tabela Ativos (posição + cotação + patrimônio) + linha TOTAL
+# Ativos (posição + cotação + total líquido + patrimônio) + linha TOTAL
 df_pos = db_positions_dataframe(as_of=data_ate_str, filtro_ativo=filtro_txt)
-df_ct  = db_rollup_costs_total_by_ticker(as_of=data_ate_str, filtro_ativo=filtro_txt)
-df_master = pd.merge(df_pos, df_ct, on="Ativo", how="outer").fillna({"Quantidade":0,"PM":0.0,"Custo Atual":0.0,"Custos":0.0,"Total":0.0})
+df_tot = db_rollup_net_total_by_ticker(as_of=data_ate_str, filtro_ativo=filtro_txt)  # TOTAL descontando venda
+df_master = pd.merge(df_pos, df_tot, on="Ativo", how="outer").fillna({"Quantidade":0,"PM":0.0,"Custo Atual":0.0,"Total":0.0})
 df_master = df_master.sort_values("Ativo")
 
 tickers_all = clean_b3_tickers(df_master["Ativo"].tolist())
-quotes_df = fetch_quotes_yahoo_for_tickers(tickers_all) if tickers_all else pd.DataFrame()
+# usa 'salt' p/ variar cache quando auto-refresh estiver ativo
+quotes_df = fetch_quotes_yahoo_for_tickers(tickers_all, _salt=int(salt)) if tickers_all else pd.DataFrame()
 last_map = {r["Ticker"]: r["Último"] for _, r in quotes_df.iterrows()} if not quotes_df.empty else {}
 
 df_master["Cotação"] = df_master["Ativo"].map(last_map)
 df_master["Patrimônio"] = df_master.apply(lambda r: (r["Quantidade"] * r["Cotação"]) if (pd.notna(r["Cotação"]) and r["Quantidade"]>0) else 0.0, axis=1)
 
-# Linha TOTAL (Custos e Patrimônio)
+# Linha TOTAL (Total líquido e Patrimônio)
 total_row = {
     "Ativo":"TOTAL",
     "Quantidade": df_master["Quantidade"].sum(skipna=True),
     "PM": None,
     "Custo Atual": df_master["Custo Atual"].sum(skipna=True),
-    "Custos": df_master["Custos"].sum(skipna=True),
     "Total": df_master["Total"].sum(skipna=True),
     "Cotação": None,
     "Patrimônio": df_master["Patrimônio"].sum(skipna=True),
@@ -994,40 +1005,43 @@ df_master_tot = pd.concat([df_master, pd.DataFrame([total_row])], ignore_index=T
 
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.markdown("#### Ativos")
-st.dataframe(
-    df_master_tot[["Ativo","Quantidade","PM","Cotação","Custos","Total","Patrimônio"]],
-    use_container_width=True, hide_index=True,
-    column_config={
-        "Quantidade": st.column_config.NumberColumn(format="%.0f"),
-        "PM": st.column_config.NumberColumn(format="R$ %.2f"),
-        "Cotação": st.column_config.NumberColumn(format="R$ %.2f"),
-        "Custos": st.column_config.NumberColumn(format="R$ %.2f"),
-        "Total": st.column_config.NumberColumn(format="R$ %.2f"),
-        "Patrimônio": st.column_config.NumberColumn(format="R$ %.2f"),
-    }
-)
+render_portfolio(df_master_tot[["Ativo","Quantidade","PM","Cotação","Total","Patrimônio"]])
+st.caption("• Total = compras − vendas (líquido).  • Patrimônio = Quantidade × Cotação (0 quando posição zerada).")
+st.markdown('</div>', unsafe_allow_html=True)
 
-# Movimentações do ticker (abaixo da tabela)
-choices = sorted([t for t in df_master["Ativo"].dropna().astype(str).unique().tolist() if t != "TOTAL"])
-pick = st.selectbox("🔎 Escolha o ativo para ver as movimentações", choices, index=0 if choices else None)
-if pick:
-    df_mov = db_movements_for_ticker(pick, as_of=data_ate_str)
-    if df_mov.empty:
-        st.info("Sem movimentações para este ticker no período.")
-    else:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown(f"#### Movimentações – {pick}")
-        # Mantém PM também nas vendas; adiciona uma coluna Patrimônio (0 em vendas; nas compras pode refletir o valor da operação)
-        df_mov_view = df_mov.copy()
-        df_mov_view["Patrimônio"] = df_mov_view.apply(lambda r: 0.0 if str(r["Operação"]).lower()=="venda" else abs(r["Valor"]), axis=1)
-        render_result_table(df_mov_view[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total","Patrimônio"]])
-        st.markdown('</div>', unsafe_allow_html=True)
+# Movimentações via POP-UP ao clicar no ticker (se disponível)
+tickers_choices = sorted([t for t in df_master["Ativo"].dropna().astype(str).unique().tolist()])
+if hasattr(st, "popover") and tickers_choices:
+    st.markdown("#### 🔔 Clique no ticker para ver as movimentações")
+    cols = st.columns(6)
+    i = 0
+    for t in tickers_choices:
+        with cols[i % 6]:
+            with st.popover(t):
+                df_mov = db_movements_for_ticker(t, as_of=data_ate_str)
+                if df_mov.empty:
+                    st.info("Sem movimentações para este ticker no período.")
+                else:
+                    # mantém PM nas vendas; colunas centralizadas via render_table()
+                    render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+        i += 1
+else:
+    # Fallback (versões de Streamlit sem popover)
+    choices = [t for t in tickers_choices if t != "TOTAL"]
+    pick = st.selectbox("🔎 Escolha o ativo para ver as movimentações", choices, index=0 if choices else None)
+    if pick:
+        df_mov = db_movements_for_ticker(pick, as_of=data_ate_str)
+        if df_mov.empty:
+            st.info("Sem movimentações para este ticker no período.")
+        else:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown(f"#### Movimentações – {pick}")
+            render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+            st.markdown('</div>', unsafe_allow_html=True)
 
-# Gerenciamento de ingestões: excluir/undo e edição manual
+# ================================ Gerenciar banco ============================
 st.markdown("### ⚙️ Gerenciar carteira")
-
 with st.expander("🗑️ Excluir/estornar uma ingestão (com undo)"):
-    # lista simples de ingestions
     conn = db_connect()
     df_ing = pd.read_sql_query("SELECT filehash, filename, layout, data_pregao, created_at FROM ingestions ORDER BY created_at DESC", conn)
     conn.close()
@@ -1053,43 +1067,3 @@ with st.expander("🗑️ Excluir/estornar uma ingestão (com undo)"):
                     st.error("Falha ao restaurar.")
             else:
                 st.info("Nada para desfazer.")
-
-with st.expander("✏️ Edição manual de um lançamento (trades_raw)"):
-    # escolha por ticker -> mostra registros e permite editar um
-    conn = db_connect()
-    df_raw_all = pd.read_sql_query("""
-        SELECT id, data_pregao, ativo, operacao, quantidade, preco_unit, valor, filehash
-        FROM trades_raw
-        ORDER BY id DESC
-    """, conn)
-    conn.close()
-    if df_raw_all.empty:
-        st.info("Nenhum lançamento para editar.")
-    else:
-        st.dataframe(df_raw_all.head(200), use_container_width=True, hide_index=True)
-        edit_id = st.number_input("ID para editar", min_value=1, step=1)
-        if st.button("Carregar ID"):
-            row = df_raw_all[df_raw_all["id"]==edit_id]
-            if row.empty:
-                st.warning("ID não encontrado.")
-            else:
-                r = row.iloc[0]
-                with st.form("edit_form"):
-                    data_p = st.text_input("Data do Pregão (dd/mm/aaaa)", value=str(r["data_pregao"]))
-                    ativo  = st.text_input("Ativo", value=str(r["ativo"]))
-                    oper   = st.selectbox("Operação", ["Compra","Venda"], index=0 if str(r["operacao"])=="Compra" else 1)
-                    qtd    = st.number_input("Quantidade", value=int(r["quantidade"]), step=1)
-                    punit  = st.number_input("Preço Unitário", value=float(r["preco_unit"] or 0.0), step=0.01, format="%.2f")
-                    valor  = st.number_input("Valor (positivo compra, negativo venda)", value=float(r["valor"]), step=0.01, format="%.2f")
-                    submitted = st.form_submit_button("Salvar alterações")
-                    if submitted:
-                        conn = db_connect(); cur = conn.cursor()
-                        cur.execute("""
-                            UPDATE trades_raw
-                            SET data_pregao=?, ativo=?, operacao=?, quantidade=?, preco_unit=?, valor=?
-                            WHERE id=?
-                        """, (data_p, ativo.upper().strip(), oper, int(qtd), float(punit), float(valor), int(edit_id)))
-                        conn.commit(); conn.close()
-                        st.success("Lançamento atualizado. Recarregue para refletir posições.")
-
-# Fim
