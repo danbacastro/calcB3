@@ -849,16 +849,6 @@ with st.sidebar:
     st.header("Opções")
     if st.button("🔄 Limpar cache e recarregar", use_container_width=True):
         st.cache_data.clear(); st.rerun()
-
-    st.markdown("---")
-    # contador de autorefresh (se lib estiver instalada). Usado como "sal" do cache.
-    salt = 0
-    if auto_quotes and st_autorefresh is not None:
-        salt = st_autorefresh(interval=interval_sec * 1000, key="auto_quotes_counter") or 0
-    elif auto_quotes:
-        # Fallback: muda o "sal" por minuto para forçar cache diferente, mas sem re-execução automática
-        salt = int(_now() // interval_sec)
-
     st.markdown("---")
     st.subheader("Banco de dados")
     try:
