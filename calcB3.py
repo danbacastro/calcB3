@@ -125,8 +125,10 @@ def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
         try:
             reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
             if getattr(reader, "is_encrypted", False):
-                try: reader.decrypt("")
-                except Exception: pass
+                try:
+                    reader.decrypt("")
+                except Exception:
+                    pass
             text = ""
             for page in reader.pages:
                 text += (page.extract_text() or "") + "\n"
@@ -439,12 +441,17 @@ def fetch_quotes_google_for_tickers(tickers: list) -> pd.DataFrame:
                 cands = re.findall(r'YMlKec[^>]*>([^<]+)<', html)
                 price = None
                 for c in cands:
-                    price = _parse_price_any(c); if price is not None: break
+                    price = _parse_price_any(c)
+                    if price is not None:
+                        break
                 if price is None:
                     m = re.search(r'data-last-price="([^"]+)"', html)
-                    if m: price = _parse_price_any(m.group(1))
-                if price is not None: ultimo = price
-                else: motivo = "preço não encontrado"
+                    if m:
+                        price = _parse_price_any(m.group(1))
+                if price is not None:
+                    ultimo = price
+                else:
+                    motivo = "preço não encontrado"
             else:
                 motivo = f"HTTP {resp.status_code}"
         except Exception as e:
@@ -491,7 +498,7 @@ def process_one_pdf(pdf_bytes: bytes, map_dict: dict):
     for _, r in df_trades.iterrows():
         tkr = (r.get("Ativo") or "").strip().upper()
         if not tkr:
-            guess = derive_from_on_pn(r.get("Nome","")); 
+            guess = derive_from_on_pn(r.get("Nome",""))
             if guess: tkr = guess
         rows.append({**r, "Ativo": tkr})
     df_trades = pd.DataFrame(rows)
