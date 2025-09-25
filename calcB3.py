@@ -561,7 +561,7 @@ def style_result_df(df: pd.DataFrame) -> Any:
     if cols_emphasis:
         sty = sty.set_properties(
             subset=cols_emphasis,
-            **{"border-left":"1px solid #000","border-right":"1px solid #000","background-color":"#f6f7f9","font-weight":"700"}
+            **{"border-left":"0px solid #000","border-right":"0px solid #000","background-color":"#f6f7f9","font-weight":"700"}
         )
         # Cabeçalhos dessas colunas
         table_styles = []
@@ -569,7 +569,7 @@ def style_result_df(df: pd.DataFrame) -> Any:
             idx = df.columns.get_loc(c)
             table_styles.append({
                 "selector": f"th.col_heading.level0.col{idx}",
-                "props": [("border","1px solid #000"),("background-color","#f6f7f9"),("font-weight","700")]
+                "props": [("border","0px solid #000"),("background-color","#f6f7f9"),("font-weight","700")]
             })
         sty = sty.set_table_styles(table_styles, overwrite=False)
 
