@@ -838,6 +838,9 @@ def gmail_fetch_pdf_attachments(service, message_id: str):
     return out
 
 def gmail_import_notes(query_default: str = 'subject:"Nota de Negociação" has:attachment filename:pdf newer_than:2y'):
+
+    XP_NOTA_QUERY = 'from:no-reply@xpi.com.br subject:"XP Investimentos | Nota de Negociação" has:attachment filename:pdf newer_than:2y'
+
     """UI compacta: conecta, busca e importa PDFs novos do Gmail."""
     st.markdown("### 📧 Importar do Gmail")
     cfg_ok = bool(_gmail_client_config_from_secrets())
@@ -855,8 +858,8 @@ def gmail_import_notes(query_default: str = 'subject:"Nota de Negociação" has:
             st.link_button("Conectar ao Gmail", url)
         return
 
-    st.caption("Conectado. Escopo: leitura de e-mails (somente).")
-    query = st.text_input("Filtro Gmail", value=query_default, help="Use operadores do Gmail (ex.: newer_than:1y, from:)")
+    st.caption(f"Filtro Gmail aplicado: `{XP_NOTA_QUERY}`")
+    query = XP_NOTA_QUERY
     maxr = st.number_input("Máx. e-mails a buscar", min_value=1, max_value=200, value=20, step=1)
 
     try:
