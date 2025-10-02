@@ -817,7 +817,8 @@ def gmail_handle_oauth_callback():
     """Processa ?code=... e troca por tokens, aceitando Testing (sem refresh_token)."""
     if Flow is None:
         return
-    params = st.experimental_get_query_params()
+    # >>> atualizado para st.query_params <<<
+    params = dict(st.query_params)
     if "code" not in params:
         return
     code = params["code"][0] if isinstance(params["code"], list) else params["code"]
@@ -835,7 +836,8 @@ def gmail_handle_oauth_callback():
         flow.fetch_token(authorization_response=auth_response)
         creds = flow.credentials
         gmail_save_creds_to_db(creds)
-        st.experimental_set_query_params()  # limpa ?code=...
+        # limpar a query string
+        st.query_params.clear()
         st.success("Gmail conectado com sucesso.")
     except Exception as e:
         st.error(f"Falha na troca de token: {e}")
@@ -1136,7 +1138,7 @@ st.markdown("""
 st.markdown('<div class="big-title">Calc B3 – Nota de Corretagem</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Consolidado de notas B3/XP, carteira e movimentações com PM, patrimônio e cotações em tempo quase real.</div>', unsafe_allow_html=True)
 
-# Mapa padrão já definido ANTES de usar o Gmail (para evitar NameError ao ingerir por e-mail)
+# Mapa padrão (antes do Gmail)
 default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}
 
 with st.sidebar:
@@ -1176,7 +1178,6 @@ with st.sidebar:
             st.warning(f"Falha ao ler CSV: {e}")
 
     st.markdown("---")
-    # Passa o default_map para o importador do Gmail
     gmail_import_notes(default_map)
 
 # ========================= Uploads & processamento ============================
