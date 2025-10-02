@@ -1,13 +1,12 @@
 # calcB3.py
 # App Streamlit: múltiplos PDFs B3/XP, rateio por valor, PM, cotações (Yahoo),
-# Banco/Carteira com posições; TOTAL descontando vendas; pop-up de movimentações
-# diretamente na tabela (popover) sem navegar; tabelas centralizadas e
-# auto-atualização de cotações (30s invisível). Integração Gmail ajustada.
+# Banco/Carteira com posições; TOTAL descontando vendas; popover de
+# movimentações diretamente na tabela; Gmail import (XP Notas) com OAuth;
+# tabelas centralizadas; auto-atualização invisível (30s).
 
 import io
 import re
 import math
-import base64
 import unicodedata
 import hashlib
 import sqlite3
@@ -20,6 +19,11 @@ from urllib.parse import urlencode
 
 import pandas as pd
 import streamlit as st
+
+# =============================================================================
+# PAGE CONFIG (deve ser o primeiro comando do Streamlit)
+# =============================================================================
+st.set_page_config(page_title="Calc B3 - Nota de Corretagem", layout="wide")
 
 # --- Auto refresh invisível (30s) ---
 try:
@@ -50,18 +54,6 @@ try:
     import yfinance as yf
 except Exception:
     yf = None
-
-# --- Gmail / Google API
-try:
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import Flow
-    from googleapiclient.discovery import build
-    from google.auth.transport.requests import Request
-except Exception:
-    Credentials = None
-    Flow = None
-    build = None
-    Request = None
 
 # =============================================================================
 # Utils
@@ -706,6 +698,18 @@ def db_movements_for_ticker(ticker: str, as_of: str | None = None) -> pd.DataFra
     return df
 
 # ============================== GMAIL INTEGRAÇÃO ===============================
+import base64
+try:
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import Flow
+    from googleapiclient.discovery import build
+    from google.auth.transport.requests import Request
+except Exception:
+    Credentials = None
+    Flow = None
+    build = None
+    Request = None
+
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 def _gmail_client_config_from_secrets() -> dict:
@@ -726,48 +730,30 @@ def gmail_load_creds_from_db() -> Optional["Credentials"]:
     if Credentials is None:
         return None
     conn = db_connect()
-    row = conn.execute("""
-        SELECT access_token, refresh_token, token_uri, client_id, client_secret, scopes, expiry
-        FROM gmail_tokens WHERE id=1
-    """).fetchone()
+    row = conn.execute("SELECT access_token, refresh_token, token_uri, client_id, client_secret, scopes, expiry FROM gmail_tokens WHERE id=1").fetchone()
     conn.close()
     if not row:
         return None
-
     access_token, refresh_token, token_uri, client_id, client_secret, scopes, expiry = row
-    scopes_list = (scopes.split() if scopes else GMAIL_SCOPES)
-
-    exp_dt = None
-    try:
-        if expiry:
-            exp_dt = datetime.fromisoformat(expiry)
-    except Exception:
-        exp_dt = None
-
+    if not refresh_token:
+        return None
     creds = Credentials(
-        token=access_token or None,
-        refresh_token=refresh_token or None,
+        token=access_token,
+        refresh_token=refresh_token,
         token_uri=token_uri or "https://oauth2.googleapis.com/token",
         client_id=client_id or st.secrets["gmail"]["client_id"],
         client_secret=client_secret or st.secrets["gmail"]["client_secret"],
-        scopes=scopes_list,
-        expiry=exp_dt
+        scopes=(scopes.split() if scopes else GMAIL_SCOPES),
     )
-
-    # Tenta renovar se possível
     try:
-        if not creds.valid and creds.refresh_token and Request is not None:
+        if not creds.valid and creds.refresh_token:
             creds.refresh(Request())
             gmail_save_creds_to_db(creds)
     except Exception:
         pass
+    return creds
 
-    # Mesmo sem refresh_token, retorna se o token ainda estiver utilizável
-    if creds.token and (creds.valid or not creds.expired):
-        return creds
-    return None
-
-def gmail_save_creds_to_db(creds: "Credentials"):
+def gmail_save_creds_to_db(creds):
     conn = db_connect()
     conn.execute("""
         INSERT INTO gmail_tokens (id, access_token, refresh_token, token_uri, client_id, client_secret, scopes, expiry)
@@ -814,13 +800,13 @@ def gmail_auth_url() -> Optional[str]:
     return auth_url
 
 def gmail_handle_oauth_callback():
-    """Processa ?code=... e troca por tokens, aceitando Testing (sem refresh_token)."""
     if Flow is None:
         return
-    # >>> atualizado para st.query_params <<<
     params = dict(st.query_params)
     if "code" not in params:
         return
+
+    # code/state retornam como lista em st.query_params
     code = params["code"][0] if isinstance(params["code"], list) else params["code"]
     cfg = _gmail_client_config_from_secrets()
     if not cfg:
@@ -828,7 +814,7 @@ def gmail_handle_oauth_callback():
         return
 
     redirect_uri = cfg["web"]["redirect_uris"][0]
-    # Reconstrói authorization_response com todos os params (code, scope, state...)
+    # Monta a authorization_response completa para o Flow validar state, etc.
     auth_response = f"{redirect_uri}?{urlencode({k: (v[0] if isinstance(v, list) else v) for k, v in params.items()})}"
 
     flow = Flow.from_client_config(cfg, scopes=GMAIL_SCOPES, redirect_uri=redirect_uri)
@@ -836,8 +822,7 @@ def gmail_handle_oauth_callback():
         flow.fetch_token(authorization_response=auth_response)
         creds = flow.credentials
         gmail_save_creds_to_db(creds)
-        # limpar a query string
-        st.query_params.clear()
+        st.query_params.clear()  # limpa a URL
         st.success("Gmail conectado com sucesso.")
     except Exception as e:
         st.error(f"Falha na troca de token: {e}")
@@ -852,7 +837,6 @@ def gmail_fetch_pdf_attachments(service, message_id: str):
     msg = service.users().messages().get(userId="me", id=message_id).execute()
     payload = msg.get("payload", {}) or {}
     parts = payload.get("parts", []) or []
-
     def _extract(parts_list):
         for p in parts_list:
             filename = p.get("filename") or ""
@@ -869,11 +853,15 @@ def gmail_fetch_pdf_attachments(service, message_id: str):
     _extract(parts)
     return out
 
-def gmail_import_notes(default_map: dict):
-    """UI compacta: conecta, busca e importa PDFs novos do Gmail (XP)."""
+def gmail_import_notes(default_map: dict, query_default: str = 'subject:"Nota de Negociação" has:attachment filename:pdf newer_than:2y'):
+    """UI compacta: conecta, busca e importa PDFs novos do Gmail."""
     XP_NOTA_QUERY = 'from:no-reply@xpi.com.br subject:"XP Investimentos | Nota de Negociação" has:attachment filename:pdf newer_than:2y'
 
     st.markdown("### 📧 Importar do Gmail")
+    if Flow is None or build is None:
+        st.info("Dependências do Google não disponíveis neste ambiente.")
+        return
+
     cfg_ok = bool(_gmail_client_config_from_secrets())
     if not cfg_ok:
         st.info("Configure os segredos `[gmail]` em *Secrets* para habilitar o login.")
@@ -881,30 +869,23 @@ def gmail_import_notes(default_map: dict):
 
     # Trata callback OAuth se existir ?code=
     gmail_handle_oauth_callback()
-
     creds = gmail_load_creds_from_db()
+
     if not creds:
         url = gmail_auth_url()
         if url:
             st.link_button("Conectar ao Gmail", url)
         return
 
-    # Já conectado → exibe e-mail do perfil
-    try:
-        if build is None:
-            st.error("Bibliotecas Google ausentes. Instale google-auth, google-auth-oauthlib, google-api-python-client.")
-            return
-        service = build("gmail", "v1", credentials=creds)
-        profile = service.users().getProfile(userId="me").execute()
-        email_addr = profile.get("emailAddress", "me")
-        st.success(f"Conectado: {email_addr}")
-    except Exception as e:
-        st.error(f"Não foi possível iniciar o cliente do Gmail: {e}")
-        return
-
     st.caption(f"Filtro Gmail aplicado: `{XP_NOTA_QUERY}`")
     query = XP_NOTA_QUERY
     maxr = st.number_input("Máx. e-mails a buscar", min_value=1, max_value=200, value=20, step=1)
+
+    try:
+        service = build("gmail", "v1", credentials=creds)
+    except Exception as e:
+        st.error(f"Não foi possível iniciar o cliente do Gmail: {e}")
+        return
 
     if st.button("🔎 Buscar e-mails"):
         try:
@@ -943,7 +924,7 @@ def gmail_import_notes(default_map: dict):
             st.success("Tokens removidos. Clique em Conectar para vincular novamente.")
 
 # =============================================================================
-# Processamento PDF (rateio custos etc.)
+# Processamento PDF
 # =============================================================================
 def allocate_with_roundfix(amounts: pd.Series, total_costs: float) -> pd.Series:
     if amounts.sum() <= 0 or total_costs <= 0:
@@ -1021,6 +1002,7 @@ def style_result_df(df: pd.DataFrame) -> Any:
         "Custos": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
         "Total": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
     })
+    # Operação colorida
     def op_style(v: Any) -> str:
         if isinstance(v, str):
             s = v.strip().lower()
@@ -1029,15 +1011,18 @@ def style_result_df(df: pd.DataFrame) -> Any:
         return "text-align:center"
     if "Operação" in df.columns:
         sty = sty.applymap(op_style, subset=["Operação"])
+    # Centralizar tudo
     sty = sty.set_properties(**{"text-align":"center"})
     sty = sty.set_table_styles([
         {"selector":"th", "props":[("text-align","center")]}
     ], overwrite=False)
+    # Destaque leve (sem fundo/negrito persistentes)
     if cols_emphasis:
         sty = sty.set_properties(
             subset=cols_emphasis,
             **{"border-left":"1px solid #e5e7eb","border-right":"1px solid #e5e7eb"}
         )
+    # Borda geral
     sty = sty.set_properties(**{"border":"1px solid #e5e7eb"})
     return sty
 
@@ -1049,14 +1034,16 @@ def render_table(df: pd.DataFrame):
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
-    """Tabela da carteira com Ticker clicável (popover) e colunas centralizadas."""
+    """Renderiza a 'tabela' de carteira com o Ticker clicável e CENTRALIZADO."""
     widths = [1.4, 1.0, 1.0, 1.0, 1.0, 1.2]
     headers = ["Ativo","Quantidade","PM","Cotação","Total","Patrimônio"]
 
+    # Cabeçalho centralizado
     cols = st.columns(widths, vertical_alignment="center")
     for c, h in zip(cols, headers):
         c.markdown(f"<div style='text-align:center;font-weight:700'>{h}</div>", unsafe_allow_html=True)
 
+    # Linhas
     for i, r in df.iterrows():
         cols = st.columns(widths, vertical_alignment="center")
         tkr = str(r["Ativo"])
@@ -1066,8 +1053,9 @@ def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
         tot = r.get("Total")
         pat = r.get("Patrimônio")
 
+        # Coluna 0: ticker centralizado
         with cols[0]:
-            left, mid, right = st.columns([1, 2, 1])
+            left, mid, right = st.columns([1, 2, 1])  # sub-grid para centralizar
             with mid:
                 if tkr == "TOTAL":
                     st.markdown("<div style='text-align:center;font-weight:700'>TOTAL</div>", unsafe_allow_html=True)
@@ -1083,6 +1071,7 @@ def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
                         if st.button(tkr, key=f"btn_{tkr}_{i}", use_container_width=True):
                             st.session_state["open_modal_tkr"] = tkr
 
+        # Demais colunas (centralizadas)
         def _num(x, money=False):
             if pd.isna(x): return ""
             return f"R$ {brl(float(x))}" if money else f"{int(x):d}"
@@ -1093,6 +1082,7 @@ def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
         cols[4].markdown(f"<div style='text-align:center'>{_num(tot, money=True)}</div>", unsafe_allow_html=True)
         cols[5].markdown(f"<div style='text-align:center'>{_num(pat, money=True)}</div>", unsafe_allow_html=True)
 
+    # Fallback modal (se não houver popover)
     if not hasattr(st, "popover") and st.session_state.get("open_modal_tkr"):
         tkr = st.session_state["open_modal_tkr"]
         if hasattr(st, "modal"):
@@ -1119,7 +1109,6 @@ def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
 # =============================================================================
 # APP
 # =============================================================================
-st.set_page_config(page_title="Calc B3 - Nota de Corretagem", layout="wide")
 db_init()
 
 st.markdown("""
@@ -1138,7 +1127,7 @@ st.markdown("""
 st.markdown('<div class="big-title">Calc B3 – Nota de Corretagem</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Consolidado de notas B3/XP, carteira e movimentações com PM, patrimônio e cotações em tempo quase real.</div>', unsafe_allow_html=True)
 
-# Mapa padrão (antes do Gmail)
+# Mapeamento nome→ticker definido ANTES do Gmail para evitar NameError
 default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}
 
 with st.sidebar:
@@ -1271,7 +1260,7 @@ df_master = df_master.sort_values("Ativo")
 tickers_all = clean_b3_tickers(df_master["Ativo"].tolist())
 salt = int(_now() // 30)  # muda a cada 30s p/ furar cache do fetch_quotes
 quotes_df = fetch_quotes_yahoo_for_tickers(tickers_all, _salt=int(salt)) if tickers_all else pd.DataFrame()
-last_map = {r["Ticker"]: r["Último"] for _, r in quotes_df.iterrows()} if not quotes_df.empty else {}
+last_map = {row["Ticker"]: row["Último"] for _, row in quotes_df.iterrows()} if not quotes_df.empty else {}
 
 df_master["Cotação"] = df_master["Ativo"].map(last_map)
 df_master["Patrimônio"] = df_master.apply(lambda r: (r["Quantidade"] * r["Cotação"]) if (pd.notna(r["Cotação"]) and r["Quantidade"]>0) else 0.0, axis=1)
