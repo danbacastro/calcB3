@@ -867,7 +867,7 @@ def gmail_fetch_pdf_attachments(service, message_id: str):
     _extract(parts)
     return out
 
-def gmail_import_notes():
+def gmail_import_notes(default_map: dict):
     """UI compacta: conecta, busca e importa PDFs novos do Gmail (XP)."""
     XP_NOTA_QUERY = 'from:no-reply@xpi.com.br subject:"XP Investimentos | Nota de Negociação" has:attachment filename:pdf newer_than:2y'
 
@@ -932,6 +932,8 @@ def gmail_import_notes():
                                 else:
                                     db_save_ingestion(res, fh, fname)
                                     st.success("Nota ingerida no banco.")
+        except Exception as e:
+            st.error(f"Erro ao buscar/baixar e-mails: {e}")
 
     with st.expander("Desconectar Gmail"):
         if st.button("Remover tokens salvos"):
@@ -1134,6 +1136,9 @@ st.markdown("""
 st.markdown('<div class="big-title">Calc B3 – Nota de Corretagem</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Consolidado de notas B3/XP, carteira e movimentações com PM, patrimônio e cotações em tempo quase real.</div>', unsafe_allow_html=True)
 
+# Mapa padrão já definido ANTES de usar o Gmail (para evitar NameError ao ingerir por e-mail)
+default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}
+
 with st.sidebar:
     st.header("Opções")
     if st.button("🔄 Limpar cache e recarregar", use_container_width=True):
@@ -1160,20 +1165,19 @@ with st.sidebar:
     st.subheader("Mapeamento opcional Nome→Ticker")
     st.write("Forneça um CSV `Nome,Ticker` se sua nota vier sem ticker.")
     map_file = st.file_uploader("Upload CSV de mapeamento (opcional)", type=["csv"], key="map_csv")
+    if map_file is not None:
+        try:
+            mdf = pd.read_csv(map_file)
+            for _, row in mdf.iterrows():
+                if pd.notna(row.get("Nome")) and pd.notna(row.get("Ticker")):
+                    k = re.sub(r"[^A-Z]","", strip_accents(str(row["Nome"])).upper())
+                    default_map[k] = str(row["Ticker"]).strip().upper()
+        except Exception as e:
+            st.warning(f"Falha ao ler CSV: {e}")
 
     st.markdown("---")
-    gmail_import_notes()
-
-default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}
-if map_file is not None:
-    try:
-        mdf = pd.read_csv(map_file)
-        for _, row in mdf.iterrows():
-            if pd.notna(row.get("Nome")) and pd.notna(row.get("Ticker")):
-                k = re.sub(r"[^A-Z]","", strip_accents(str(row["Nome"])).upper())
-                default_map[k] = str(row["Ticker"]).strip().upper()
-    except Exception as e:
-        st.warning(f"Falha ao ler CSV: {e}")
+    # Passa o default_map para o importador do Gmail
+    gmail_import_notes(default_map)
 
 # ========================= Uploads & processamento ============================
 uploads = st.file_uploader("Carregue um ou mais PDFs da B3/XP", type=["pdf"], accept_multiple_files=True, key="pdfs")
