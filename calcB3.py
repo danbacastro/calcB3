@@ -489,6 +489,17 @@ def db_init():
         value REAL,
         FOREIGN KEY(filehash) REFERENCES ingestions(filehash) ON DELETE CASCADE
     );
+    -- Tokens do Gmail (um registro só)
+    CREATE TABLE IF NOT EXISTS gmail_tokens (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        access_token TEXT,
+        refresh_token TEXT,
+        token_uri TEXT,
+        client_id TEXT,
+        client_secret TEXT,
+        scopes TEXT,
+        expiry TEXT
+    );
     """)
     conn.commit()
     conn.close()
@@ -679,6 +690,216 @@ def db_movements_for_ticker(ticker: str, as_of: str | None = None) -> pd.DataFra
     """, conn, params=params)
     conn.close()
     return df
+
+# ============================== GMAIL INTEGRAÇÃO ===============================
+import base64
+from typing import Optional
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
+
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+def _gmail_client_config_from_secrets() -> dict:
+    conf = st.secrets.get("gmail", {})
+    if not conf or not conf.get("client_id") or not conf.get("client_secret") or not conf.get("redirect_uri"):
+        return {}
+    return {
+        "web": {
+            "client_id": conf["client_id"],
+            "client_secret": conf["client_secret"],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [conf["redirect_uri"]],
+        }
+    }
+
+def gmail_load_creds_from_db() -> Optional[Credentials]:
+    conn = db_connect()
+    row = conn.execute("SELECT access_token, refresh_token, token_uri, client_id, client_secret, scopes, expiry FROM gmail_tokens WHERE id=1").fetchone()
+    conn.close()
+    if not row:
+        return None
+    access_token, refresh_token, token_uri, client_id, client_secret, scopes, expiry = row
+    if not refresh_token:
+        return None
+    creds = Credentials(
+        token=access_token,
+        refresh_token=refresh_token,
+        token_uri=token_uri or "https://oauth2.googleapis.com/token",
+        client_id=client_id or st.secrets["gmail"]["client_id"],
+        client_secret=client_secret or st.secrets["gmail"]["client_secret"],
+        scopes=(scopes.split() if scopes else GMAIL_SCOPES),
+    )
+    # refresh se necessário
+    try:
+        if not creds.valid and creds.refresh_token:
+            creds.refresh(Request())
+            gmail_save_creds_to_db(creds)
+    except Exception:
+        pass
+    return creds
+
+def gmail_save_creds_to_db(creds: Credentials):
+    conn = db_connect()
+    conn.execute("""
+        INSERT INTO gmail_tokens (id, access_token, refresh_token, token_uri, client_id, client_secret, scopes, expiry)
+        VALUES (1,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+            access_token=excluded.access_token,
+            refresh_token=excluded.refresh_token,
+            token_uri=excluded.token_uri,
+            client_id=excluded.client_id,
+            client_secret=excluded.client_secret,
+            scopes=excluded.scopes,
+            expiry=excluded.expiry
+    """, (
+        creds.token or "",
+        getattr(creds, "refresh_token", "") or "",
+        getattr(creds, "token_uri", "https://oauth2.googleapis.com/token"),
+        st.secrets["gmail"]["client_id"],
+        st.secrets["gmail"]["client_secret"],
+        " ".join(GMAIL_SCOPES),
+        getattr(creds, "expiry", None).isoformat() if getattr(creds, "expiry", None) else None,
+    ))
+    conn.commit()
+    conn.close()
+
+def gmail_clear_tokens():
+    conn = db_connect()
+    conn.execute("DELETE FROM gmail_tokens WHERE id=1")
+    conn.commit()
+    conn.close()
+
+def gmail_auth_url() -> Optional[str]:
+    cfg = _gmail_client_config_from_secrets()
+    if not cfg:
+        return None
+    flow = Flow.from_client_config(cfg, scopes=GMAIL_SCOPES, redirect_uri=cfg["web"]["redirect_uris"][0])
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+    st.session_state["gmail_oauth_state"] = state
+    return auth_url
+
+def gmail_handle_oauth_callback():
+    # Captura ?code= no retorno do Google
+    params = st.query_params if hasattr(st, "query_params") else st.experimental_get_query_params()
+    if "code" not in params:
+        return
+    code = params["code"] if isinstance(params["code"], str) else params["code"][0]
+    cfg = _gmail_client_config_from_secrets()
+    if not cfg:
+        st.warning("Config do Gmail ausente em st.secrets.")
+        return
+    flow = Flow.from_client_config(cfg, scopes=GMAIL_SCOPES, redirect_uri=cfg["web"]["redirect_uris"][0])
+    try:
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        gmail_save_creds_to_db(creds)
+        # limpa a query string
+        if hasattr(st, "query_params"):
+            st.query_params.clear()
+        else:
+            st.experimental_set_query_params()
+        st.success("Gmail conectado com sucesso.")
+    except Exception as e:
+        st.error(f"Falha na troca de token: {e}")
+
+def gmail_list_messages(service, query: str, max_results: int = 20):
+    resp = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
+    return resp.get("messages", [])
+
+def gmail_fetch_pdf_attachments(service, message_id: str):
+    """Retorna lista [(filename, bytes)] apenas de PDFs do email message_id."""
+    out = []
+    msg = service.users().messages().get(userId="me", id=message_id).execute()
+    payload = msg.get("payload", {}) or {}
+    parts = payload.get("parts", []) or []
+    # corpo simples também pode ter attachmentId no body
+    def _extract(parts_list):
+        for p in parts_list:
+            filename = p.get("filename") or ""
+            body = p.get("body", {}) or {}
+            if p.get("mimeType") == "application/pdf" or filename.lower().endswith(".pdf"):
+                att_id = body.get("attachmentId")
+                if att_id:
+                    att = service.users().messages().attachments().get(userId="me", messageId=message_id, id=att_id).execute()
+                    data = att.get("data")
+                    if data:
+                        out.append((filename or f"{message_id}.pdf", base64.urlsafe_b64decode(data)))
+            # partes aninhadas
+            if "parts" in p:
+                _extract(p["parts"])
+    _extract(parts)
+    return out
+
+def gmail_import_notes(query_default: str = 'subject:"Nota de Negociação" has:attachment filename:pdf newer_than:2y'):
+    """UI compacta: conecta, busca e importa PDFs novos do Gmail."""
+    st.markdown("### 📧 Importar do Gmail")
+    cfg_ok = bool(_gmail_client_config_from_secrets())
+    if not cfg_ok:
+        st.info("Configure os segredos `[gmail]` em *Secrets* para habilitar o login.")
+        return
+
+    # Trata callback OAuth se existir ?code=
+    gmail_handle_oauth_callback()
+    creds = gmail_load_creds_from_db()
+
+    if not creds:
+        url = gmail_auth_url()
+        if url:
+            st.link_button("Conectar ao Gmail", url)
+        return
+
+    st.caption("Conectado. Escopo: leitura de e-mails (somente).")
+    query = st.text_input("Filtro Gmail", value=query_default, help="Use operadores do Gmail (ex.: newer_than:1y, from:)")
+    maxr = st.number_input("Máx. e-mails a buscar", min_value=1, max_value=200, value=20, step=1)
+
+    try:
+        service = build("gmail", "v1", credentials=creds)
+    except Exception as e:
+        st.error(f"Não foi possível iniciar o cliente do Gmail: {e}")
+        return
+
+    if st.button("🔎 Buscar e-mails"):
+        try:
+            msgs = gmail_list_messages(service, query=query, max_results=int(maxr))
+            if not msgs:
+                st.info("Nenhum e-mail encontrado com esse filtro.")
+            else:
+                st.success(f"Encontrados {len(msgs)} e-mail(s).")
+                for m in msgs:
+                    mid = m.get("id")
+                    pdfs = gmail_fetch_pdf_attachments(service, mid)
+                    if not pdfs:
+                        continue
+                    for fname, pdfb in pdfs:
+                        fh = sha1(pdfb)
+                        exists = db_already_ingested(fh)
+                        cols = st.columns([3,1,1])
+                        with cols[0]:
+                            st.write(f"📎 **{fname}** — hash `{fh[:10]}...`")
+                        with cols[1]:
+                            st.write("Status:", "🟡 já no banco" if exists else "🟢 novo")
+                        with cols[2]:
+                            if st.button("➕ Ingerir", key=f"ing_{fh}", disabled=exists):
+                                res = process_one_pdf(pdfb, default_map)
+                                if not res.get("ok"):
+                                    st.error(res.get("error", "Falha no processamento"))
+                                else:
+                                    db_save_ingestion(res, fh, fname)
+                                    st.success("Nota ingerida no banco.")
+        except Exception as e:
+            st.error(f"Erro ao buscar/baixar e-mails: {e}")
+
+    with st.expander("Desconectar Gmail"):
+        if st.button("Remover tokens salvos"):
+            gmail_clear_tokens()
+            st.success("Tokens removidos. Clique em Conectar para vincular novamente.")
 
 # =============================================================================
 # Processamento PDF
@@ -915,6 +1136,9 @@ with st.sidebar:
     st.subheader("Mapeamento opcional Nome→Ticker")
     st.write("Forneça um CSV `Nome,Ticker` se sua nota vier sem ticker.")
     map_file = st.file_uploader("Upload CSV de mapeamento (opcional)", type=["csv"], key="map_csv")
+
+    st.markdown("---")
+    gmail_import_notes()
 
 default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}
 if map_file is not None:
