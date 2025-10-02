@@ -231,7 +231,7 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
         spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
         qty = int(m.group("qty"))
         price = parse_brl_number(m.group("price"))
-        value = parse_brl_number(m.group("value"])
+        value = parse_brl_number(m.group("value"))
         dc = m.group("dc")
         ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
         if not ticker:
