@@ -124,17 +124,20 @@ def _norm_pwd_variants(raw: str) -> list[str]:
 
 def _collect_pdf_passwords_from_secrets() -> list[str]:
     def _pull(path):
-        try:
-            v = st.secrets
-            for k in path:
-                v = v.get(k) if isinstance(v, dict) else None
-            return v
-        except Exception:
-            return None
+        # ← usar .get do SecretsMapping, sem checar tipo dict
+        v = st.secrets
+        for k in path:
+            try:
+                v = v.get(k)  # se não existir, retorna None
+            except Exception:
+                return None
+            if v is None:
+                return None
+        return v
 
     candidates = []
     try:
-        # chaves na raiz
+        # raiz
         for path in [("pdf_password",), ("pdf_passwords",)]:
             v = _pull(path)
             if v is None:
@@ -144,7 +147,7 @@ def _collect_pdf_passwords_from_secrets() -> list[str]:
             else:
                 if str(v).strip():
                     candidates.append(str(v))
-        # chaves dentro de [pdf]
+        # seção [pdf]
         for path in [("pdf","password"), ("pdf","passwords")]:
             v = _pull(path)
             if v is None:
@@ -157,7 +160,6 @@ def _collect_pdf_passwords_from_secrets() -> list[str]:
     except Exception:
         pass
 
-    # normaliza + variações
     final = []
     for raw in candidates:
         for v in _norm_pwd_variants(raw):
@@ -230,18 +232,15 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
                 pass
 
     # 2) PyMuPDF (fitz)
-    if fitz is not None:
+   if fitz is not None:
+    for p in pwds:
         try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            if getattr(doc, "is_encrypted", False):
-                authed = False
-                for p in pwds:
-                    try:
-                        if p and doc.authenticate(p):
-                            authed = True
-                            break
-                    except Exception:
-                        continue
+            doc = fitz.open(stream=file_bytes, filetype="pdf", password=p if p else None)
+            text = "\n".join(page.get_text("text") for page in doc)
+            if text.strip():
+                return text, f"PyMuPDF{' + pwd' if p else ''}"
+        except Exception:
+            continue
                 if not authed:
                     # algumas versões aceitam authenticate("") para sem senha
                     try:
