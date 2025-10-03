@@ -314,78 +314,84 @@ def clean_b3_tickers(lst) -> list:
 # Parsers & headers
 # =============================================================================
 def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
-    # normaliza NBSP
-    text = text.replace("\xa0", " ")
-    lines = text.splitlines()
-    # removi a exigência do '@' no filtro de linhas (alguns extratores tiram quebras de linha)
-    trade_lines = [l for l in lines if ("BOVESPA" in l and "VISTA" in l)]
+    # Normalizações leves para extratores (NBSP, múltiplos espaços)
+    t = text.replace("\xa0", " ")
+    t = re.sub(r"[ \t]+", " ", t)
 
+    # Aceita "@", "@  " OU só espaçamento largo entre a especificação e a quantidade
     pat = _re.compile(
-        r"BOVESPA\s+(?P<cv>[CV])\s+VISTA\s+(?P<spec>.+?)@\s+"
-        r"(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+"
-        r"(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<dc>[CD])"
+        r"BOVESPA\s+(?P<cv>[CV])\s+VISTA\s+"
+        r"(?P<spec>.+?)"
+        r"(?:@|\s{2,})\s+"
+        r"(?P<qty>\d+)\s+"
+        r"(?P<price>\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})\s+"
+        r"(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})\s+"
+        r"(?P<dc>[CD])",
+        flags=_re.IGNORECASE | _re.DOTALL,
     )
 
     recs = []
-    for line in trade_lines:
-        # >>> principal ajuste: capturar TODAS as ocorrências na MESMA linha
-        for m in pat.finditer(line):
-            cv = m.group("cv")
-            spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
-            qty = int(m.group("qty"))
-            price = parse_brl_number(m.group("price"))
-            value = parse_brl_number(m.group("value"))
-            dc = m.group("dc")
+    for m in pat.finditer(t):
+        cv = m.group("cv").upper()
+        spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
+        qty = int(m.group("qty"))
+        price = parse_brl_number(m.group("price"))
+        value = parse_brl_number(m.group("value"))
+        dc = m.group("dc").upper()
 
-            ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
-            if not ticker:
-                key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
-                ticker = name_to_ticker_map.get(key)
-            if not ticker:
-                ticker = derive_from_on_pn(spec) or ""
+        ticker = extract_ticker_from_text(spec)
+        if not ticker:
+            key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
+            ticker = name_to_ticker_map.get(key)
+        if not ticker:
+            ticker = derive_from_on_pn(spec) or ""
 
-            recs.append({
-                "Ativo": ticker, "Nome": spec,
-                "Operação": "Compra" if cv == "C" else "Venda",
-                "Quantidade": qty, "Preço_Unitário": price,
-                "Valor": value if cv == "C" else -value, "Sinal_DC": dc
-            })
+        recs.append({
+            "Ativo": ticker, "Nome": spec,
+            "Operação": "Compra" if cv == "C" else "Venda",
+            "Quantidade": qty, "Preço_Unitário": price,
+            "Valor": value if cv == "C" else -value, "Sinal_DC": dc
+        })
 
     return pd.DataFrame(recs)
 
 def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
-    text = text.replace("\xa0", " ")
-    lines = [l for l in text.splitlines() if "@" in l and _re.search(r"\d{1,3}(?:\.\d{3})*,\d{2}", l)]
+    t = text.replace("\xa0", " ")
+    t = re.sub(r"[ \t]+", " ", t)
+
+    # Também aceita ausência de "@" (apenas espaçamento de tabela)
     pat = _re.compile(
-        r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?(?P<spec>.+?)@\s+"
-        r"(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+"
-        r"(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})"
+        r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b)\s+"
+        r"(?P<spec>.+?)"
+        r"(?:@|\s{2,})\s+"
+        r"(?P<qty>\d+)\s+"
+        r"(?P<price>\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})\s+"
+        r"(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})",
+        flags=_re.IGNORECASE | _re.DOTALL,
     )
 
     recs = []
-    for line in lines:
-        # >>> idem: pegar todas as ocorrências na linha
-        for m in pat.finditer(line):
-            cv_raw = m.group("cv").strip().upper()
-            cv = "C" if cv_raw.startswith("C") else "V"
-            spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
-            qty = int(m.group("qty"))
-            price = parse_brl_number(m.group("price"))
-            value = parse_brl_number(m.group("value"))
+    for m in pat.finditer(t):
+        cv_raw = m.group("cv").strip().upper()
+        cv = "C" if cv_raw.startswith("C") else "V"
+        spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
+        qty = int(m.group("qty"))
+        price = parse_brl_number(m.group("price"))
+        value = parse_brl_number(m.group("value"))
 
-            ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
-            if not ticker:
-                key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
-                ticker = name_to_ticker_map.get(key)
-            if not ticker:
-                ticker = derive_from_on_pn(spec) or ""
+        ticker = extract_ticker_from_text(spec)
+        if not ticker:
+            key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
+            ticker = name_to_ticker_map.get(key)
+        if not ticker:
+            ticker = derive_from_on_pn(spec) or ""
 
-            recs.append({
-                "Ativo": ticker, "Nome": spec,
-                "Operação": "Compra" if cv == "C" else "Venda",
-                "Quantidade": qty, "Preço_Unitário": price,
-                "Valor": value if cv == "C" else -value, "Sinal_DC": ""
-            })
+        recs.append({
+            "Ativo": ticker, "Nome": spec,
+            "Operação": "Compra" if cv == "C" else "Venda",
+            "Quantidade": qty, "Preço_Unitário": price,
+            "Valor": value if cv == "C" else -value, "Sinal_DC": ""
+        })
     return pd.DataFrame(recs)
 
 def parse_trades_any(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
@@ -975,7 +981,7 @@ def gmail_fetch_pdf_attachments(service, message_id: str):
     _walk(payload.get("parts"))
     return out
 
-def gmail_import_notes():
+def gmail_import_notes(map_dict: dict):
     XP_NOTA_QUERY = 'from:no-reply@xpi.com.br subject:"XP Investimentos | Nota de Negociação" has:attachment filename:pdf newer_than:2y'
 
     st.markdown("### 📧 Importar do Gmail")
@@ -1026,7 +1032,7 @@ def gmail_import_notes():
                             st.write("Status:", "🟡 já no banco" if exists else "🟢 novo")
                         with cols[2]:
                             if st.button("➕ Ingerir", key=f"ing_{fh}", disabled=exists):
-                                res = process_one_pdf(pdfb, default_map, _pwd_sig=_PWD_SIG)
+                                res = process_one_pdf(pdfb, map_dict, _pwd_sig=_PWD_SIG)
                                 if not res.get("ok"):
                                     st.error(res.get("error", "Falha no processamento"))
                                 else:
@@ -1322,6 +1328,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# --- default_map precisa existir ANTES do importador Gmail ser chamado
+default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}
+
 st.markdown('<div class="big-title">Calc B3 – Nota de Corretagem</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Consolidado de notas B3/XP, carteira e movimentações com PM, patrimônio e cotações em tempo quase real.</div>', unsafe_allow_html=True)
 
@@ -1351,20 +1360,19 @@ with st.sidebar:
     st.subheader("Mapeamento opcional Nome→Ticker")
     st.write("Forneça um CSV `Nome,Ticker` se sua nota vier sem ticker.")
     map_file = st.file_uploader("Upload CSV de mapeamento (opcional)", type=["csv"], key="map_csv")
+    if map_file is not None:
+        try:
+            mdf = pd.read_csv(map_file)
+            for _, row in mdf.iterrows():
+                if pd.notna(row.get("Nome")) and pd.notna(row.get("Ticker")):
+                    k = re.sub(r"[^A-Z]","", strip_accents(str(row["Nome"])).upper())
+                    default_map[k] = str(row["Ticker"]).strip().upper()
+        except Exception as e:
+            st.warning(f"Falha ao ler CSV: {e}")
 
     st.markdown("---")
-    gmail_import_notes()
-
-default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}
-if map_file is not None:
-    try:
-        mdf = pd.read_csv(map_file)
-        for _, row in mdf.iterrows():
-            if pd.notna(row.get("Nome")) and pd.notna(row.get("Ticker")):
-                k = re.sub(r"[^A-Z]","", strip_accents(str(row["Nome"])).upper())
-                default_map[k] = str(row["Ticker"]).strip().upper()
-    except Exception as e:
-        st.warning(f"Falha ao ler CSV: {e}")
+    # passa explicitamente o map_dict para evitar NameError
+    gmail_import_notes(default_map)
 
 # ========================= Uploads & processamento ============================
 uploads = st.file_uploader("Carregue um ou mais PDFs da B3/XP", type=["pdf"], accept_multiple_files=True, key="pdfs")
