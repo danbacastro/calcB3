@@ -124,7 +124,7 @@ def _norm_pwd_variants(raw: str) -> list[str]:
 
 def _collect_pdf_passwords_from_secrets() -> list[str]:
     def _pull(path):
-        # ← usar .get do SecretsMapping, sem checar tipo dict
+        # usar .get do SecretsMapping, sem checar tipo dict
         v = st.secrets
         for k in path:
             try:
@@ -231,17 +231,17 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
             except Exception:
                 pass
 
-# 2) PyMuPDF (fitz)
-if fitz is not None:
-    for p in pwds:
-        try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf", password=(p if p else None))
-            text = "\n".join(pg.get_text("text") for pg in doc)
-            if text.strip():
-                return text, f"PyMuPDF{' + pwd' if p else ''}"
-            # abriu mas não gerou texto? tenta próxima senha/engine
-        except Exception:
-            continue
+    # 2) PyMuPDF (fitz)
+    if fitz is not None:
+        for p in pwds:
+            try:
+                doc = fitz.open(stream=file_bytes, filetype="pdf", password=(p if p else None))
+                text = "\n".join(pg.get_text("text") for pg in doc)
+                if text.strip():
+                    return text, f"PyMuPDF{' + pwd' if p else ''}"
+                # abriu mas não gerou texto? tenta próxima senha/engine
+            except Exception:
+                continue
 
     # 3) PyPDF2
     if PyPDF2 is not None:
