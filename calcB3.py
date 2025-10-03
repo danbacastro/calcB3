@@ -2,13 +2,7 @@
 # App Streamlit: múltiplos PDFs B3/XP, rateio por valor, PM, cotações (Yahoo),
 # Banco/Carteira com posições; TOTAL descontando vendas; pop-up de movimentações
 # diretamente na tabela (popover) sem navegar; tabelas centralizadas e
-# auto-atualização de cotações (30s invisível).
-#
-# PDF com senha: ler de st.secrets:
-#   pdf_password  = "SENHA"
-#   pdf_passwords = ["SENHA1","SENHA2", ...]
-#
-# Gmail: configure st.secrets["gmail"] = { client_id, client_secret, redirect_uri }
+# auto-atualização de cotações (30s invisível). Integração Gmail + PDF com senha.
 
 import io
 import re
@@ -21,7 +15,6 @@ from typing import Any, Optional
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from time import time as _now
-import base64
 
 import pandas as pd
 import streamlit as st
@@ -56,17 +49,12 @@ try:
 except Exception:
     yf = None
 
-# --- Google / Gmail
-try:
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import Flow
-    from googleapiclient.discovery import build
-    from google.auth.transport.requests import Request
-except Exception:
-    Credentials = None
-    Flow = None
-    build = None
-    Request = None
+# --- Gmail / Google
+import base64
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
 
 # =============================================================================
 # Utils
@@ -104,78 +92,120 @@ def _fmt_dt_local(dt) -> str:
         except Exception:
             return str(dt)
 
-# Helpers de senha (apenas st.secrets)
-def _coerce_list(x) -> list[str]:
-    if x is None:
+# =============================================================================
+# Senhas para PDF (via Secrets)
+# =============================================================================
+def _norm_pwd_variants(raw: str) -> list[str]:
+    """Gera variações úteis: remove pontuação; datas dd/mm/aaaa -> ddmmaaaa e yyyymmdd."""
+    v = str(raw or "").strip()
+    if not v:
         return []
-    if isinstance(x, (list, tuple, set)):
-        return [str(v) for v in x if str(v).strip()]
-    return [str(x)] if str(x).strip() else []
+    outs = []
 
-def _norm_pwd_variants(p: str) -> list[str]:
-    p = str(p)
-    s1 = p.strip()
-    s2 = "".join(ch for ch in s1 if ch.isalnum())  # remove .-/ e espaços
-    out = [s1]
-    if s2 and s2 != s1:
-        out.append(s2)
-    # dd/mm/aaaa -> ddmmaaaa e yyyymmdd
-    m = re.fullmatch(r"(\d{2})[\/\-.](\d{2})[\/\-.](\d{4})", s1)
+    # original
+    outs.append(v)
+
+    # sem pontuação
+    v_nopunct = re.sub(r"[^\w]", "", v, flags=re.UNICODE)
+    if v_nopunct and v_nopunct not in outs:
+        outs.append(v_nopunct)
+
+    # datas dd/mm/aaaa
+    m = re.fullmatch(r"(\d{2})[\/\-\.](\d{2})[\/\-\.](\d{4})", v)
     if m:
-        dd, mm, yyyy = m.groups()
-        out.append(f"{dd}{mm}{yyyy}")
-        out.append(f"{yyyy}{mm}{dd}")
-    return list(dict.fromkeys([v for v in out if v]))
+        d, mth, y = m.group(1), m.group(2), m.group(3)
+        ddmmaaaa = f"{d}{mth}{y}"
+        yyyymmdd = f"{y}{mth}{d}"
+        for k in (ddmmaaaa, yyyymmdd):
+            if k not in outs:
+                outs.append(k)
+
+    return outs
 
 def _collect_pdf_passwords_from_secrets() -> list[str]:
-    pwds = []
+    def _pull(path):
+        try:
+            v = st.secrets
+            for k in path:
+                v = v.get(k) if isinstance(v, dict) else None
+            return v
+        except Exception:
+            return None
+
+    candidates = []
     try:
-        pwds += _coerce_list(st.secrets.get("pdf_password", None))
-        pwds += _coerce_list(st.secrets.get("pdf_passwords", None))
+        # chaves na raiz
+        for path in [("pdf_password",), ("pdf_passwords",)]:
+            v = _pull(path)
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple, set)):
+                candidates += [str(x) for x in v if str(x).strip()]
+            else:
+                if str(v).strip():
+                    candidates.append(str(v))
+        # chaves dentro de [pdf]
+        for path in [("pdf","password"), ("pdf","passwords")]:
+            v = _pull(path)
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple, set)):
+                candidates += [str(x) for x in v if str(x).strip()]
+            else:
+                if str(v).strip():
+                    candidates.append(str(v))
     except Exception:
         pass
-    # normaliza e dedup
+
+    # normaliza + variações
     final = []
-    for raw in pwds:
+    for raw in candidates:
         for v in _norm_pwd_variants(raw):
             if v not in final:
                 final.append(v)
     return final
 
-# =============================================================================
-# PDF → texto (com senha via st.secrets)
-# =============================================================================
-def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
-    # Senhas: somente as do st.secrets (e None)
-    pwd_candidates = [None] + _collect_pdf_passwords_from_secrets()
+# Assinatura das senhas para invalidar cache quando secrets mudarem
+_PWD_LIST = _collect_pdf_passwords_from_secrets()
+_PWD_SIG = sha1("||".join(_PWD_LIST).encode()) if _PWD_LIST else ""
 
-    # 1) pdfplumber strict
+# =============================================================================
+# PDF → texto (com suporte a senha)
+# =============================================================================
+def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = None) -> tuple[str, str]:
+    """
+    Tenta extrair texto usando pdfplumber, PyMuPDF (fitz) e PyPDF2.
+    Suporta PDFs protegidos com senha (lista de tentativas).
+    Retorna (texto, "engine usada").
+    """
+    pwds = [None] + (passwords or [])
+
+    # 1) pdfplumber (tenta senhas na ordem)
     if pdfplumber is not None:
-        for pwd in pwd_candidates:
+        for p in pwds:
             try:
-                with pdfplumber.open(io.BytesIO(file_bytes), password=pwd) as pdf:
+                with pdfplumber.open(io.BytesIO(file_bytes), password=p) as pdf:
+                    # a) strict
                     text = ""
                     for page in pdf.pages:
                         text += (page.extract_text(x_tolerance=1, y_tolerance=1) or "") + "\n"
                     if text.strip():
-                        return text, f"pdfplumber (strict tol=1/1, pwd={'set' if pwd else 'none'})"
+                        return text, f"pdfplumber (strict tol=1/1){' + pwd' if p else ''}"
             except Exception:
                 pass
-        # 1b) default
-        for pwd in pwd_candidates:
             try:
-                with pdfplumber.open(io.BytesIO(file_bytes), password=pwd) as pdf:
+                with pdfplumber.open(io.BytesIO(file_bytes), password=p) as pdf:
+                    # b) default
                     text = ""
                     for page in pdf.pages:
                         text += (page.extract_text() or "") + "\n"
                     if text.strip():
-                        return text, f"pdfplumber (default tol, pwd={'set' if pwd else 'none'})"
+                        return text, f"pdfplumber (default tol){' + pwd' if p else ''}"
             except Exception:
                 pass
-        # 1c) reconstructed words
-        for pwd in pwd_candidates:
             try:
-                with pdfplumber.open(io.BytesIO(file_bytes), password=pwd) as pdf:
+                with pdfplumber.open(io.BytesIO(file_bytes), password=p) as pdf:
+                    # c) reconstructed words
                     chunks = []
                     for page in pdf.pages:
                         words = page.extract_words(use_text_flow=True) or []
@@ -195,46 +225,64 @@ def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, str]:
                                 chunks.append(" ".join(line_words))
                     text = "\n".join(chunks)
                     if text.strip():
-                        return text, f"pdfplumber (reconstructed, pwd={'set' if pwd else 'none'})"
+                        return text, f"pdfplumber (reconstructed words){' + pwd' if p else ''}"
             except Exception:
                 pass
 
-    # 2) PyMuPDF
+    # 2) PyMuPDF (fitz)
     if fitz is not None:
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            ok = True
-            if doc.is_encrypted:
-                ok = False
-                for pwd in pwd_candidates:
-                    if pwd and doc.authenticate(pwd):
-                        ok = True
-                        break
-            if ok:
-                text = "\n".join(page.get_text("text") for page in doc)
-                if text.strip():
-                    return text, "PyMuPDF (fitz)"
+            if getattr(doc, "is_encrypted", False):
+                authed = False
+                for p in pwds:
+                    try:
+                        if p and doc.authenticate(p):
+                            authed = True
+                            break
+                    except Exception:
+                        continue
+                if not authed:
+                    # algumas versões aceitam authenticate("") para sem senha
+                    try:
+                        doc.authenticate("")
+                    except Exception:
+                        pass
+            text = "\n".join(page.get_text("text") for page in doc)
+            if text.strip():
+                return text, "PyMuPDF (fitz)"
         except Exception:
             pass
 
     # 3) PyPDF2
     if PyPDF2 is not None:
-        for pwd in pwd_candidates:
-            try:
-                reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-                if getattr(reader, "is_encrypted", False):
-                    res = reader.decrypt("" if pwd is None else pwd)  # 0/1
-                    if res == 0:
+        try:
+            reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+            if getattr(reader, "is_encrypted", False):
+                opened = False
+                for p in pwds:
+                    try:
+                        res = reader.decrypt("" if p is None else p)
+                        if res == 1:
+                            opened = True
+                            break
+                    except Exception:
                         continue
-                text = ""
-                for page in reader.pages:
-                    text += (page.extract_text() or "") + "\n"
-                if text.strip():
-                    return text, f"PyPDF2 (pwd={'set' if pwd else 'none'})"
-            except Exception:
-                pass
+                if not opened:
+                    # tenta sem senha explícita
+                    try:
+                        reader.decrypt("")
+                    except Exception:
+                        pass
+            text = ""
+            for page in reader.pages:
+                text += (page.extract_text() or "") + "\n"
+            if text.strip():
+                return text, "PyPDF2"
+        except Exception:
+            pass
 
-    return "", "none/password-protected?"
+    return "", "none"
 
 # =============================================================================
 # Tickers
@@ -642,7 +690,7 @@ def db_save_ingestion(res: dict, filehash: str, filename: str):
     ))
     fees = res.get("fees") or {}
     for k, v in fees.items():
-        if k.startswith("_"):
+        if k.startswith("_"): 
             continue
         cur.execute("INSERT INTO fees_components (filehash, key, value) VALUES (?,?,?)", (filehash, k, float(v)))
     df_raw = res.get("df_valid")
@@ -664,7 +712,7 @@ def db_save_ingestion(res: dict, filehash: str, filename: str):
                 VALUES (?,?,?,?,?,?,?,?,?)
             """, (
                 filehash, r["Data do Pregão"], r["Ativo"], r["Operação"],
-                int(r["Quantidade"]), float(r["Valor"]),
+                int(r["Quantidade"]), float(r["Valor"]), 
                 float(r["Preço Médio"]) if pd.notna(r["Preço Médio"]) else None,
                 float(r["Custos"]), float(r["Total"])
             ))
@@ -782,8 +830,6 @@ def _gmail_client_config_from_secrets() -> dict:
     }
 
 def gmail_load_creds_from_db() -> Optional[Credentials]:
-    if Credentials is None:
-        return None
     conn = db_connect()
     row = conn.execute("SELECT access_token, refresh_token, token_uri, client_id, client_secret, scopes, expiry FROM gmail_tokens WHERE id=1").fetchone()
     conn.close()
@@ -841,8 +887,6 @@ def gmail_clear_tokens():
     conn.close()
 
 def gmail_auth_url() -> Optional[str]:
-    if Flow is None:
-        return None
     cfg = _gmail_client_config_from_secrets()
     if not cfg:
         return None
@@ -856,22 +900,27 @@ def gmail_auth_url() -> Optional[str]:
     return auth_url
 
 def gmail_handle_oauth_callback():
-    # Captura ?code= no retorno do Google (Streamlit 1.50+: st.query_params)
+    # Captura ?code= no retorno do Google
     params = st.query_params
-    if "code" not in params:
+    code = params.get("code")
+    if not code:
         return
-    code = params["code"] if isinstance(params["code"], str) else params["code"][0]
+    if isinstance(code, list):
+        code = code[0]
     cfg = _gmail_client_config_from_secrets()
     if not cfg:
         st.warning("Config do Gmail ausente em st.secrets.")
         return
+    flow = Flow.from_client_config(cfg, scopes=GMAIL_SCOPES, redirect_uri=cfg["web"]["redirect_uris"][0])
     try:
-        flow = Flow.from_client_config(cfg, scopes=GMAIL_SCOPES, redirect_uri=cfg["web"]["redirect_uris"][0])
         flow.fetch_token(code=code)
         creds = flow.credentials
         gmail_save_creds_to_db(creds)
         # limpa a query string
-        st.query_params.clear()
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
         st.success("Gmail conectado com sucesso.")
     except Exception as e:
         st.error(f"Falha na troca de token: {e}")
@@ -886,6 +935,7 @@ def gmail_fetch_pdf_attachments(service, message_id: str):
     msg = service.users().messages().get(userId="me", id=message_id).execute()
     payload = msg.get("payload", {}) or {}
     parts = payload.get("parts", []) or []
+    # corpo simples também pode ter attachmentId no body
     def _extract(parts_list):
         for p in parts_list:
             filename = p.get("filename") or ""
@@ -897,12 +947,13 @@ def gmail_fetch_pdf_attachments(service, message_id: str):
                     data = att.get("data")
                     if data:
                         out.append((filename or f"{message_id}.pdf", base64.urlsafe_b64decode(data)))
+            # partes aninhadas
             if "parts" in p:
                 _extract(p["parts"])
     _extract(parts)
     return out
 
-def gmail_import_notes(query_default: str = 'subject:"Nota de Negociação" has:attachment filename:pdf newer_than:2y'):
+def gmail_import_notes():
     XP_NOTA_QUERY = 'from:no-reply@xpi.com.br subject:"XP Investimentos | Nota de Negociação" has:attachment filename:pdf newer_than:2y'
 
     st.markdown("### 📧 Importar do Gmail")
@@ -953,12 +1004,9 @@ def gmail_import_notes(query_default: str = 'subject:"Nota de Negociação" has:
                             st.write("Status:", "🟡 já no banco" if exists else "🟢 novo")
                         with cols[2]:
                             if st.button("➕ Ingerir", key=f"ing_{fh}", disabled=exists):
-                                res = process_one_pdf(pdfb, default_map)
+                                res = process_one_pdf(pdfb, default_map, _pwd_sig=_PWD_SIG)
                                 if not res.get("ok"):
-                                    if res.get("extractor","").endswith("password-protected?"):
-                                        st.warning("PDF parece protegido por senha. Defina `pdf_password`/`pdf_passwords` em *Secrets* e tente novamente.")
-                                    else:
-                                        st.error(res.get("error", "Falha no processamento"))
+                                    st.error(res.get("error", "Falha no processamento"))
                                 else:
                                     db_save_ingestion(res, fh, fname)
                                     st.success("Nota ingerida no banco.")
@@ -990,10 +1038,10 @@ def allocate_with_roundfix(amounts: pd.Series, total_costs: float) -> pd.Series:
     return floored
 
 @st.cache_data(show_spinner=False)
-def process_one_pdf(pdf_bytes: bytes, map_dict: dict):
-    text, extractor = extract_text_from_pdf(pdf_bytes)
+def process_one_pdf(pdf_bytes: bytes, map_dict: dict, _pwd_sig: str = ""):
+    text, extractor = extract_text_from_pdf(pdf_bytes, passwords=_PWD_LIST)
     if not text:
-        return {"ok": False, "error": "Não consegui extrair texto do PDF.", "extractor": extractor}
+        return {"ok": False, "error": "Não consegui extrair texto do PDF (talvez senha incorreta?).", "extractor": extractor}
     layout = detect_layout(text)
     data_pregao_str, liquido_para_data_str, liquido_para_valor_str = parse_header_dates_and_net(text)
     df_trades = parse_trades_any(text, map_dict)
@@ -1049,18 +1097,23 @@ def style_result_df(df: pd.DataFrame) -> Any:
         "Custos": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
         "Total": lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else "",
     })
-    # Operação colorida (pandas Styler.map)
-    def _op_css(v: Any) -> str:
+    # Operação colorida
+    def op_style(v: Any) -> str:
         if isinstance(v, str):
             s = v.strip().lower()
             if s == "compra": return "color:#16a34a; font-weight:700; text-align:center"
             if s == "venda":  return "color:#dc2626; font-weight:700; text-align:center"
         return "text-align:center"
     if "Operação" in df.columns:
-        sty = sty.map(lambda x: _op_css(x), subset=["Operação"])
+        try:
+            sty = sty.map(op_style, subset=pd.IndexSlice[:, ["Operação"]])  # pandas >= 2.3
+        except Exception:
+            sty = sty.applymap(op_style, subset=["Operação"])  # fallback
     # Centralizar tudo
     sty = sty.set_properties(**{"text-align":"center"})
-    sty = sty.set_table_styles([{"selector":"th", "props":[("text-align","center")]}], overwrite=False)
+    sty = sty.set_table_styles([
+        {"selector":"th", "props":[("text-align","center")]}
+    ], overwrite=False)
     # Destaque leve nas colunas pedidas (sem fundo/negrito persistentes)
     if cols_emphasis:
         sty = sty.set_properties(
@@ -1079,9 +1132,7 @@ def render_table(df: pd.DataFrame):
         st.dataframe(df, width="stretch", hide_index=True)
 
 def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
-    """Renderiza a 'tabela' de carteira com o Ticker clicável e CENTRALIZADO
-       na coluna Ativo: usa uma sub-grid [1,2,1] e coloca o trigger no meio.
-    """
+    """Renderiza a 'tabela' de carteira com o Ticker clicável e CENTRALIZADO."""
     widths = [1.4, 1.0, 1.0, 1.0, 1.0, 1.2]
     headers = ["Ativo","Quantidade","PM","Cotação","Total","Patrimônio"]
 
@@ -1100,28 +1151,27 @@ def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
         tot = r.get("Total")
         pat = r.get("Patrimônio")
 
-        # Coluna 0: ticker centralizado
+        def _num(x, money=False):
+            if pd.isna(x): return ""
+            return f"R$ {brl(float(x))}" if money else f"{int(x):d}"
+
+        # Coluna 0: ticker
         with cols[0]:
-            left, mid, right = st.columns([1, 2, 1])  # sub-grid para centralizar
+            left, mid, right = st.columns([1, 2, 1])
             with mid:
                 if tkr == "TOTAL":
                     st.markdown("<div style='text-align:center;font-weight:700'>TOTAL</div>", unsafe_allow_html=True)
                 else:
                     if hasattr(st, "popover"):
-                        with st.popover(tkr):
+                        with st.popover(tkr, use_container_width=True):
                             df_mov = db_movements_for_ticker(tkr, as_of=as_of_str)
                             if df_mov.empty:
                                 st.info("Sem movimentações para este ticker no período.")
                             else:
                                 render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
                     else:
-                        if st.button(tkr, key=f"btn_{tkr}_{i}"):
+                        if st.button(tkr, key=f"btn_{tkr}_{i}", use_container_width=True):
                             st.session_state["open_modal_tkr"] = tkr
-
-        # Demais colunas (centralizadas)
-        def _num(x, money=False):
-            if pd.isna(x): return ""
-            return f"R$ {brl(float(x))}" if money else f"{int(x):d}"
 
         cols[1].markdown(f"<div style='text-align:center'>{_num(qtd)}</div>", unsafe_allow_html=True)
         cols[2].markdown(f"<div style='text-align:center'>{_num(pm, money=True)}</div>", unsafe_allow_html=True)
@@ -1129,7 +1179,7 @@ def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
         cols[4].markdown(f"<div style='text-align:center'>{_num(tot, money=True)}</div>", unsafe_allow_html=True)
         cols[5].markdown(f"<div style='text-align:center'>{_num(pat, money=True)}</div>", unsafe_allow_html=True)
 
-    # Fallback modal (se não houver popover)
+    # Fallback modal
     if not hasattr(st, "popover") and st.session_state.get("open_modal_tkr"):
         tkr = st.session_state["open_modal_tkr"]
         if hasattr(st, "modal"):
@@ -1152,6 +1202,84 @@ def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
             if st.button("Fechar"):
                 st.session_state.pop("open_modal_tkr", None)
             st.markdown('</div>', unsafe_allow_html=True)
+
+# ---------------------- Diagnóstico (opcional) ----------------------
+def debug_probe_pdf_passwords(pdf_bytes: bytes) -> pd.DataFrame:
+    cols = ["Engine", "Encrypted?", "Pwd idx", "Opened", "TextLen", "Note"]
+    rows = []
+    pwds = [None] + _collect_pdf_passwords_from_secrets()
+
+    # PyMuPDF
+    if fitz:
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            enc = bool(doc.is_encrypted)
+            opened = not enc
+            used_idx = None
+            note = ""
+            if enc:
+                for i, p in enumerate(pwds):
+                    try:
+                        if p and doc.authenticate(p):
+                            opened = True
+                            used_idx = i
+                            break
+                    except Exception:
+                        continue
+                if not opened:
+                    note = "fitz não autenticou com nenhuma senha"
+            txt = ""
+            if opened:
+                try:
+                    txt = "\n".join(page.get_text("text") for page in doc)
+                except Exception as e:
+                    note = f"fitz get_text falhou: {e}"
+            rows.append(["PyMuPDF", enc, used_idx, opened, len(txt), note])
+        except Exception as e:
+            rows.append(["PyMuPDF", "-", "-", False, 0, f"erro abrir: {e}"])
+
+    # pdfplumber
+    if pdfplumber:
+        ok = False
+        for i, p in enumerate(pwds):
+            try:
+                with pdfplumber.open(io.BytesIO(pdf_bytes), password=p) as pdf:
+                    txt = "".join(((page.extract_text() or "") + "\n") for page in pdf.pages)
+                    if txt.strip():
+                        rows.append(["pdfplumber", "?", i, True, len(txt), ""])
+                        ok = True
+                        break
+            except Exception:
+                continue
+        if not ok:
+            rows.append(["pdfplumber", "?", "-", False, 0, "não abriu ou sem texto"])
+
+    # PyPDF2
+    if PyPDF2:
+        try:
+            reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+            enc = getattr(reader, "is_encrypted", False)
+            ok = not enc
+            used_idx = None
+            if enc:
+                for i, p in enumerate(pwds):
+                    try:
+                        res = reader.decrypt("" if p is None else p)
+                        if res == 1:
+                            ok = True
+                            used_idx = i
+                            break
+                    except Exception:
+                        continue
+            txt = ""
+            if ok:
+                for pg in reader.pages:
+                    txt += (pg.extract_text() or "") + "\n"
+            rows.append(["PyPDF2", enc, used_idx, ok, len(txt), ""])
+        except Exception as e:
+            rows.append(["PyPDF2", "-", "-", False, 0, f"erro abrir: {e}"])
+
+    return pd.DataFrame(rows, columns=cols)
 
 # =============================================================================
 # APP
@@ -1177,7 +1305,7 @@ st.markdown('<div class="subtitle">Consolidado de notas B3/XP, carteira e movime
 
 with st.sidebar:
     st.header("Opções")
-    if st.button("🔄 Limpar cache e recarregar"):
+    if st.button("🔄 Limpar cache e recarregar", use_container_width=True):
         st.cache_data.clear(); st.rerun()
     st.markdown("---")
     st.subheader("Banco de dados")
@@ -1187,9 +1315,9 @@ with st.sidebar:
         st.caption("Arquivo DB: carteira.db")
     if Path("carteira.db").exists():
         st.download_button("⬇️ Exportar DB (carteira.db)", data=Path("carteira.db").read_bytes(),
-                           file_name="carteira.db", mime="application/octet-stream")
+                           file_name="carteira.db", mime="application/octet-stream", use_container_width=True)
     db_up = st.file_uploader("⬆️ Importar/Substituir DB (.db)", type=["db","sqlite"], key="db_upload")
-    if db_up and st.button("Substituir banco atual"):
+    if db_up and st.button("Substituir banco atual", use_container_width=True):
         try:
             Path("carteira.db").write_bytes(db_up.read())
             st.success("Banco substituído com sucesso.")
@@ -1223,17 +1351,31 @@ if uploads:
     for f in uploads:
         try:
             pdf_bytes = f.read()
-            res = process_one_pdf(pdf_bytes, default_map)
+            res = process_one_pdf(pdf_bytes, default_map, _pwd_sig=_PWD_SIG)
             res["filename"] = f.name
             res["filehash"] = sha1(pdf_bytes)
         except Exception as e:
             res = {"ok": False, "error": str(e), "filename": f.name, "filehash": "NA"}
         results.append(res)
 
+# ---------------- Diagnóstico PDF c/ senha (opcional) ----------------
+with st.expander("🔐 Diagnóstico PDF com senha"):
+    diag_file = st.file_uploader("Carregue um PDF só para teste", type=["pdf"], key="diag_pdf")
+    st.caption(f"Senhas carregadas dos Secrets: {len(_PWD_LIST)} (não exibidas)")
+    if diag_file and st.button("Testar PDF"):
+        try:
+            df_diag = debug_probe_pdf_passwords(diag_file.read())
+            if df_diag.empty:
+                st.info("Nada para mostrar.")
+            else:
+                st.dataframe(df_diag, width="stretch", hide_index=True)
+        except Exception as e:
+            st.error(f"Falha no diagnóstico: {e}")
+
 # ================================ Consolidado =================================
 st.markdown("## 📚 Consolidado")
 if not results:
-    st.info("Envie um ou mais arquivos PDF para ver o consolidado.")
+    st.info("Envie um ou mais arquivos PDF para ver o consolidado (ou use o importador Gmail na barra lateral).")
 else:
     valid_outs = [r["out"] for r in results if r.get("ok")]
     if not valid_outs:
@@ -1272,7 +1414,7 @@ else:
         if st.button("➕ Adicionar todas as notas visíveis"):
             inserted = 0; duplicated = 0
             for r in results:
-                if not r.get("ok"):
+                if not r.get("ok"): 
                     continue
                 fh = r["filehash"]
                 if db_already_ingested(fh) and not allow_dups:
