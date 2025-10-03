@@ -242,17 +242,6 @@ if fitz is not None:
             # abriu mas não gerou texto? tenta próxima senha/engine
         except Exception:
             continue
-                if not authed:
-                    # algumas versões aceitam authenticate("") para sem senha
-                    try:
-                        doc.authenticate("")
-                    except Exception:
-                        pass
-            text = "\n".join(page.get_text("text") for page in doc)
-            if text.strip():
-                return text, "PyMuPDF (fitz)"
-        except Exception:
-            pass
 
     # 3) PyPDF2
     if PyPDF2 is not None:
