@@ -314,78 +314,78 @@ def clean_b3_tickers(lst) -> list:
 # Parsers & headers
 # =============================================================================
 def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
+    # normaliza NBSP
+    text = text.replace("\xa0", " ")
     lines = text.splitlines()
+    # removi a exigência do '@' no filtro de linhas (alguns extratores tiram quebras de linha)
+    trade_lines = [l for l in lines if ("BOVESPA" in l and "VISTA" in l)]
 
-    # Padrão antigo (com VISTA e "@")
-    pat_old = _re.compile(
+    pat = _re.compile(
         r"BOVESPA\s+(?P<cv>[CV])\s+VISTA\s+(?P<spec>.+?)@\s+"
-        r"(?P<qty>\d{1,3}(?:\.\d{3})*)\s+(?P<price>\d+,\d+)\s+"
+        r"(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+"
         r"(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<dc>[CD])"
-    )
-    # Padrão novo (sem "@", sem exigir "VISTA")
-    pat_new = _re.compile(
-        r"\bBOVESPA\s+(?P<cv>[CV])\s+(?P<spec>.+?)\s+"
-        r"(?P<qty>\d{1,3}(?:\.\d{3})*)\s+(?P<price>\d+,\d+)\s+"
-        r"(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<dc>[CD])\b"
     )
 
     recs = []
-    for line in lines:
-        m = pat_old.search(line) or pat_new.search(line)
-        if not m:
-            continue
-        cv = m.group("cv")
-        spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
-        qty = int(m.group("qty").replace(".", ""))  # aceita 1.000 etc
-        price = parse_brl_number(m.group("price"))
-        value = parse_brl_number(m.group("value"))
-        dc = m.group("dc")
+    for line in trade_lines:
+        # >>> principal ajuste: capturar TODAS as ocorrências na MESMA linha
+        for m in pat.finditer(line):
+            cv = m.group("cv")
+            spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
+            qty = int(m.group("qty"))
+            price = parse_brl_number(m.group("price"))
+            value = parse_brl_number(m.group("value"))
+            dc = m.group("dc")
 
-        # tenta achar ticker na especificação/linha; se vier "ABEV ON", cai no derive_from_on_pn → "ABEV3"
-        ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
-        if not ticker:
-            key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
-            ticker = name_to_ticker_map.get(key)
-        if not ticker:
-            ticker = derive_from_on_pn(spec) or ""
+            ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
+            if not ticker:
+                key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
+                ticker = name_to_ticker_map.get(key)
+            if not ticker:
+                ticker = derive_from_on_pn(spec) or ""
 
-        recs.append({
-            "Ativo": ticker, "Nome": spec,
-            "Operação": "Compra" if cv == "C" else "Venda",
-            "Quantidade": qty, "Preço_Unitário": price,
-            "Valor": value if cv == "C" else -value, "Sinal_DC": dc
-        })
+            recs.append({
+                "Ativo": ticker, "Nome": spec,
+                "Operação": "Compra" if cv == "C" else "Venda",
+                "Quantidade": qty, "Preço_Unitário": price,
+                "Valor": value if cv == "C" else -value, "Sinal_DC": dc
+            })
 
     return pd.DataFrame(recs)
 
 def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
+    text = text.replace("\xa0", " ")
     lines = [l for l in text.splitlines() if "@" in l and _re.search(r"\d{1,3}(?:\.\d{3})*,\d{2}", l)]
     pat = _re.compile(
-        r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?(?P<spec>.+?)@\s+(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})"
+        r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?(?P<spec>.+?)@\s+"
+        r"(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+"
+        r"(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})"
     )
+
     recs = []
     for line in lines:
-        m = pat.search(line)
-        if not m:
-            continue
-        cv_raw = m.group("cv").strip().upper()
-        cv = "C" if cv_raw.startswith("C") else "V"
-        spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
-        qty = int(m.group("qty"))
-        price = parse_brl_number(m.group("price"))
-        value = parse_brl_number(m.group("value"))
-        ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
-        if not ticker:
-            key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
-            ticker = name_to_ticker_map.get(key)
-        if not ticker:
-            ticker = derive_from_on_pn(spec) or ""
-        recs.append({
-            "Ativo": ticker, "Nome": spec,
-            "Operação": "Compra" if cv == "C" else "Venda",
-            "Quantidade": qty, "Preço_Unitário": price,
-            "Valor": value if cv == "C" else -value, "Sinal_DC": ""
-        })
+        # >>> idem: pegar todas as ocorrências na linha
+        for m in pat.finditer(line):
+            cv_raw = m.group("cv").strip().upper()
+            cv = "C" if cv_raw.startswith("C") else "V"
+            spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
+            qty = int(m.group("qty"))
+            price = parse_brl_number(m.group("price"))
+            value = parse_brl_number(m.group("value"))
+
+            ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
+            if not ticker:
+                key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
+                ticker = name_to_ticker_map.get(key)
+            if not ticker:
+                ticker = derive_from_on_pn(spec) or ""
+
+            recs.append({
+                "Ativo": ticker, "Nome": spec,
+                "Operação": "Compra" if cv == "C" else "Venda",
+                "Quantidade": qty, "Preço_Unitário": price,
+                "Valor": value if cv == "C" else -value, "Sinal_DC": ""
+            })
     return pd.DataFrame(recs)
 
 def parse_trades_any(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
