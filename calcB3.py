@@ -934,26 +934,45 @@ def gmail_list_messages(service, query: str, max_results: int = 20):
 
 def gmail_fetch_pdf_attachments(service, message_id: str):
     """Retorna lista [(filename, bytes)] apenas de PDFs do email message_id."""
+    import base64
+
+    def _b64url_to_bytes(s: str) -> bytes:
+        if not s:
+            return b""
+        pad = "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s + pad)
+
     out = []
-    msg = service.users().messages().get(userId="me", id=message_id).execute()
+    msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
     payload = msg.get("payload", {}) or {}
-    parts = payload.get("parts", []) or []
-    # corpo simples também pode ter attachmentId no body
-    def _extract(parts_list):
-        for p in parts_list:
-            filename = p.get("filename") or ""
-            body = p.get("body", {}) or {}
-            if p.get("mimeType") == "application/pdf" or filename.lower().endswith(".pdf"):
-                att_id = body.get("attachmentId")
-                if att_id:
-                    att = service.users().messages().attachments().get(userId="me", messageId=message_id, id=att_id).execute()
-                    data = att.get("data")
-                    if data:
-                        out.append((filename or f"{message_id}.pdf", base64.urlsafe_b64decode(data)))
-            # partes aninhadas
-            if "parts" in p:
-                _extract(p["parts"])
-    _extract(parts)
+
+    def _maybe_add(part, default_name: str):
+        if not isinstance(part, dict):
+            return
+        filename = (part.get("filename") or default_name).strip()
+        mime = (part.get("mimeType") or "").lower()
+        body = part.get("body", {}) or {}
+        att_id = body.get("attachmentId")
+        # Aceita application/pdf OU qualquer mimetype com filename .pdf
+        if att_id and (mime == "application/pdf" or filename.lower().endswith(".pdf")):
+            att = service.users().messages().attachments().get(
+                userId="me", messageId=message_id, id=att_id
+            ).execute()
+            data = att.get("data")
+            if data:
+                out.append((filename or default_name, _b64url_to_bytes(data)))
+
+    # 1) Checa o payload raiz (alguns emails trazem o PDF direto aqui)
+    _maybe_add(payload, default_name=f"{message_id}.pdf")
+
+    # 2) Percorre recursivamente as partes
+    def _walk(parts):
+        for p in parts or []:
+            _maybe_add(p, default_name=f"{message_id}.pdf")
+            if p.get("parts"):
+                _walk(p.get("parts"))
+
+    _walk(payload.get("parts"))
     return out
 
 def gmail_import_notes():
