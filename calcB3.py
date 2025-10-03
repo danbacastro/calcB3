@@ -231,14 +231,15 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
             except Exception:
                 pass
 
-    # 2) PyMuPDF (fitz)
-   if fitz is not None:
+# 2) PyMuPDF (fitz)
+if fitz is not None:
     for p in pwds:
         try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf", password=p if p else None)
-            text = "\n".join(page.get_text("text") for page in doc)
+            doc = fitz.open(stream=file_bytes, filetype="pdf", password=(p if p else None))
+            text = "\n".join(pg.get_text("text") for pg in doc)
             if text.strip():
                 return text, f"PyMuPDF{' + pwd' if p else ''}"
+            # abriu mas não gerou texto? tenta próxima senha/engine
         except Exception:
             continue
                 if not authed:
