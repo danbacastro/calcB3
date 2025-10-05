@@ -19,8 +19,6 @@ from time import time as _now
 import pandas as pd
 import streamlit as st
 
-APP_BUILD = "gmail-ingest-state-2025-10-05"
-
 # --- Auto refresh invisível (30s) ---
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -104,21 +102,16 @@ def _norm_pwd_variants(raw: str) -> list[str]:
         return []
     outs = []
 
-    # original
-    outs.append(v)
+    outs.append(v)  # original
 
-    # sem pontuação
     v_nopunct = re.sub(r"[^\w]", "", v, flags=re.UNICODE)
     if v_nopunct and v_nopunct not in outs:
         outs.append(v_nopunct)
 
-    # datas dd/mm/aaaa
     m = re.fullmatch(r"(\d{2})[\/\-\.](\d{2})[\/\-\.](\d{4})", v)
     if m:
         d, mth, y = m.group(1), m.group(2), m.group(3)
-        ddmmaaaa = f"{d}{mth}{y}"
-        yyyymmdd = f"{y}{mth}{d}"
-        for k in (ddmmaaaa, yyyymmdd):
+        for k in (f"{d}{mth}{y}", f"{y}{mth}{d}"):
             if k not in outs:
                 outs.append(k)
 
@@ -126,11 +119,10 @@ def _norm_pwd_variants(raw: str) -> list[str]:
 
 def _collect_pdf_passwords_from_secrets() -> list[str]:
     def _pull(path):
-        # usar .get do SecretsMapping, sem checar tipo dict
         v = st.secrets
         for k in path:
             try:
-                v = v.get(k)  # se não existir, retorna None
+                v = v.get(k)
             except Exception:
                 return None
             if v is None:
@@ -139,26 +131,22 @@ def _collect_pdf_passwords_from_secrets() -> list[str]:
 
     candidates = []
     try:
-        # raiz
         for path in [("pdf_password",), ("pdf_passwords",)]:
             v = _pull(path)
             if v is None:
                 continue
             if isinstance(v, (list, tuple, set)):
                 candidates += [str(x) for x in v if str(x).strip()]
-            else:
-                if str(v).strip():
-                    candidates.append(str(v))
-        # seção [pdf]
+            elif str(v).strip():
+                candidates.append(str(v))
         for path in [("pdf","password"), ("pdf","passwords")]:
             v = _pull(path)
             if v is None:
                 continue
             if isinstance(v, (list, tuple, set)):
                 candidates += [str(x) for x in v if str(x).strip()]
-            else:
-                if str(v).strip():
-                    candidates.append(str(v))
+            elif str(v).strip():
+                candidates.append(str(v))
     except Exception:
         pass
 
@@ -169,7 +157,6 @@ def _collect_pdf_passwords_from_secrets() -> list[str]:
                 final.append(v)
     return final
 
-# Assinatura das senhas para invalidar cache quando secrets mudarem
 _PWD_LIST = _collect_pdf_passwords_from_secrets()
 _PWD_SIG = sha1("||".join(_PWD_LIST).encode()) if _PWD_LIST else ""
 
@@ -184,12 +171,11 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
     """
     pwds = [None] + (passwords or [])
 
-    # 1) pdfplumber (tenta senhas na ordem)
+    # 1) pdfplumber
     if pdfplumber is not None:
         for p in pwds:
             try:
                 with pdfplumber.open(io.BytesIO(file_bytes), password=p) as pdf:
-                    # a) strict
                     text = ""
                     for page in pdf.pages:
                         text += (page.extract_text(x_tolerance=1, y_tolerance=1) or "") + "\n"
@@ -199,7 +185,6 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
                 pass
             try:
                 with pdfplumber.open(io.BytesIO(file_bytes), password=p) as pdf:
-                    # b) default
                     text = ""
                     for page in pdf.pages:
                         text += (page.extract_text() or "") + "\n"
@@ -209,7 +194,6 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
                 pass
             try:
                 with pdfplumber.open(io.BytesIO(file_bytes), password=p) as pdf:
-                    # c) reconstructed words
                     chunks = []
                     for page in pdf.pages:
                         words = page.extract_words(use_text_flow=True) or []
@@ -317,7 +301,7 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     # normaliza NBSP
     text = text.replace("\xa0", " ")
     lines = text.splitlines()
-    # linhas candidatas
+    # sem obrigar '@' no filtro da linha
     trade_lines = [l for l in lines if ("BOVESPA" in l and "VISTA" in l)]
 
     pat = _re.compile(
@@ -328,7 +312,8 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
 
     recs = []
     for line in trade_lines:
-        for m in pat.finditer(line):  # captura TODAS as ocorrências na mesma linha
+        # captura TODAS as ocorrências na mesma linha
+        for m in pat.finditer(line):
             cv = m.group("cv")
             spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
             qty = int(m.group("qty"))
@@ -691,7 +676,7 @@ def db_save_ingestion(res: dict, filehash: str, filename: str):
     ))
     fees = res.get("fees") or {}
     for k, v in fees.items():
-        if k.startswith("_"): 
+        if k.startswith("_"):
             continue
         cur.execute("INSERT INTO fees_components (filehash, key, value) VALUES (?,?,?)", (filehash, k, float(v)))
     df_raw = res.get("df_valid")
@@ -713,7 +698,7 @@ def db_save_ingestion(res: dict, filehash: str, filename: str):
                 VALUES (?,?,?,?,?,?,?,?,?)
             """, (
                 filehash, r["Data do Pregão"], r["Ativo"], r["Operação"],
-                int(r["Quantidade"]), float(r["Valor"]), 
+                int(r["Quantidade"]), float(r["Valor"]),
                 float(r["Preço Médio"]) if pd.notna(r["Preço Médio"]) else None,
                 float(r["Custos"]), float(r["Total"])
             ))
@@ -847,7 +832,6 @@ def gmail_load_creds_from_db() -> Optional[Credentials]:
         client_secret=client_secret or st.secrets["gmail"]["client_secret"],
         scopes=(scopes.split() if scopes else GMAIL_SCOPES),
     )
-    # refresh se necessário
     try:
         if not creds.valid and creds.refresh_token:
             creds.refresh(Request())
@@ -901,7 +885,6 @@ def gmail_auth_url() -> Optional[str]:
     return auth_url
 
 def gmail_handle_oauth_callback():
-    # Captura ?code= no retorno do Google
     params = st.query_params
     code = params.get("code")
     if not code:
@@ -917,7 +900,6 @@ def gmail_handle_oauth_callback():
         flow.fetch_token(code=code)
         creds = flow.credentials
         gmail_save_creds_to_db(creds)
-        # limpa a query string
         try:
             st.query_params.clear()
         except Exception:
@@ -926,158 +908,160 @@ def gmail_handle_oauth_callback():
     except Exception as e:
         st.error(f"Falha na troca de token: {e}")
 
-# ---------- Utilidades Gmail (metadados de anexos → depois baixa no clique) ---
-def _b64url_to_bytes(s: str) -> bytes:
-    if not s:
-        return b""
-    pad = "=" * (-len(s) % 4)
-    return base64.urlsafe_b64decode(s + pad)
-
 def gmail_list_messages(service, query: str, max_results: int = 20):
     resp = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
     return resp.get("messages", [])
 
+# ---------- NOVO: coleta de metadados dos anexos (sem baixar ainda) ----------
 def gmail_collect_pdf_attachment_meta(service, message_id: str):
-    """Retorna lista de metadados: [{'message_id', 'attachment_id', 'filename'}]."""
+    """Retorna lista de metadados: [{'message_id','attachment_id','filename'}] sem duplicatas."""
     out = []
+    seen = set()
+
     msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
     payload = msg.get("payload", {}) or {}
 
-    def _walk(parts):
-        for p in parts or []:
-            if not isinstance(p, dict):
-                continue
-            filename = (p.get("filename") or "").strip()
-            mime = (p.get("mimeType") or "").lower()
-            body = p.get("body", {}) or {}
-            att_id = body.get("attachmentId")
-            # aceita application/pdf ou filename .pdf
-            if att_id and (mime == "application/pdf" or filename.lower().endswith(".pdf")):
-                out.append({"message_id": message_id, "attachment_id": att_id, "filename": filename or f"{message_id}.pdf"})
-            if p.get("parts"):
-                _walk(p.get("parts"))
+    def visit(part):
+        if not isinstance(part, dict):
+            return
+        filename = (part.get("filename") or "").strip()
+        mime = (part.get("mimeType") or "").lower()
+        body = part.get("body", {}) or {}
+        att_id = body.get("attachmentId")
+        if att_id and (mime == "application/pdf" or filename.lower().endswith(".pdf")):
+            key = (message_id, att_id)
+            if key not in seen:
+                seen.add(key)
+                out.append({
+                    "message_id": message_id,
+                    "attachment_id": att_id,
+                    "filename": filename or f"{message_id}.pdf"
+                })
+        for child in part.get("parts") or []:
+            visit(child)
 
-    # raiz + partes aninhadas
-    _walk([payload] + (payload.get("parts") or []))
+    visit(payload)
     return out
 
-def gmail_fetch_one_pdf(service, message_id: str, attachment_id: str, filename_fallback: str) -> tuple[str, bytes] | None:
-    try:
-        att = service.users().messages().attachments().get(
-            userId="me", messageId=message_id, id=attachment_id
-        ).execute()
-        data = att.get("data")
-        if data:
-            return (filename_fallback, _b64url_to_bytes(data))
-    except Exception:
-        pass
-    return None
+def gmail_fetch_one_pdf(service, message_id: str, attachment_id: str, filename: str) -> tuple[str, bytes]:
+    """Baixa UM anexo PDF."""
+    att = service.users().messages().attachments().get(
+        userId="me", messageId=message_id, id=attachment_id
+    ).execute()
+    data = att.get("data") or ""
+    # normaliza padding do base64url
+    pad = "=" * (-len(data) % 4)
+    raw = base64.urlsafe_b64decode(data + pad) if data else b""
+    return (filename or f"{message_id}.pdf"), raw
 
-# ---------- Importador Gmail com estado persistente ---------------------------
-def gmail_import_notes():
+# ---------- IMPORTADOR (com estado e dedup) ----------
+def gmail_import_notes(name_to_ticker_map: dict):
+    DEFAULT_QUERY = "from:no-reply@xpi.com.br ('xp investimentos | nota de negociação')"
+
     st.markdown("### 📧 Importar do Gmail")
     cfg_ok = bool(_gmail_client_config_from_secrets())
     if not cfg_ok:
         st.info("Configure os segredos `[gmail]` em *Secrets* para habilitar o login.")
         return
 
-    # Trata callback OAuth se existir ?code=
     gmail_handle_oauth_callback()
     creds = gmail_load_creds_from_db()
 
     if not creds:
         url = gmail_auth_url()
         if url:
-            # Abrir na mesma aba
-            st.markdown(f"[Conectar ao Gmail]({url})", unsafe_allow_html=True)
+            st.link_button("Conectar ao Gmail", url)
         return
 
-    # Constrói serviço (vamos usar tanto para buscar quanto para ingerir)
     try:
         service = build("gmail", "v1", credentials=creds)
     except Exception as e:
         st.error(f"Não foi possível iniciar o cliente do Gmail: {e}")
         return
 
-    # Permitir editar a query (sua observação do filtro!)
-    default_query = "from:no-reply@xpi.com.br ('xp investimentos | nota de negociação')"
-    query = st.text_input("Filtro Gmail (edite se quiser)", value=default_query)
-    maxr = st.number_input("Máx. e-mails a buscar", min_value=1, max_value=200, value=20, step=1)
+    # Estado
+    st.session_state.setdefault("gmail_items", [])
+    st.session_state.setdefault("ingested_hashes", set())
+    st.session_state.setdefault("gmail_query", DEFAULT_QUERY)
 
-    # Estado persistente para resultados
-    st.session_state.setdefault("gmail_items", [])          # lista de anexos (metadados)
-    st.session_state.setdefault("gmail_last_summary", "")   # resumo da última busca
-    st.session_state.setdefault("ingested_results", [])     # resultados já processados (para mostrar no Consolidado)
-    st.session_state.setdefault("ingested_hashes", set())   # para desabilitar botões
+    with st.container():
+        st.caption("Use o filtro que você validou no Gmail (editável abaixo).")
+        colq1, colq2 = st.columns([3,1])
+        with colq1:
+            q = st.text_input("Filtro de busca (Gmail advanced search)", value=st.session_state["gmail_query"], key="gmail_query_input")
+        with colq2:
+            maxr = st.number_input("Máx. e-mails", min_value=1, max_value=200, value=20, step=1)
 
-    colA, colB = st.columns([1,3])
-    with colA:
-        if st.button("🔎 Buscar e-mails"):
+        cbtn1, cbtn2 = st.columns([1,1])
+        if cbtn1.button("🔎 Buscar e-mails"):
             try:
-                msgs = gmail_list_messages(service, query=query, max_results=int(maxr))
+                st.session_state["gmail_query"] = q
+                msgs = gmail_list_messages(service, query=q, max_results=int(maxr))
                 items = []
                 for m in msgs or []:
                     mid = m.get("id")
                     items.extend(gmail_collect_pdf_attachment_meta(service, mid))
+                # Dedup por (message_id, attachment_id)
+                unique = {}
+                for it in items:
+                    unique[(it["message_id"], it["attachment_id"])] = it
+                items = list(unique.values())
                 st.session_state["gmail_items"] = items
-                st.session_state["gmail_last_summary"] = f"{len(msgs or [])} e-mail(s), {len(items)} anexo(s) PDF"
-            except Exception as e:
-                st.session_state["gmail_items"] = []
-                st.session_state["gmail_last_summary"] = f"Erro: {e}"
-    with colB:
-        st.caption(f"Resultado da busca: {st.session_state.get('gmail_last_summary') or '—'}")
-
-    # Render dos anexos (fora do if, persiste após rerun)
-    items = st.session_state.get("gmail_items") or []
-    if not items:
-        st.info("Nada listado ainda. Clique em **Buscar e-mails**.")
-        return
-
-    st.write("**Anexos encontrados:**")
-    for it in items:
-        mid = it["message_id"]
-        att_id = it["attachment_id"]
-        fname = it.get("filename") or f"{mid}.pdf"
-        key = f"ing_{mid}_{att_id}"
-        fh_preview = f"{mid}:{att_id}"
-
-        cols = st.columns([3,1.2,1.2])
-        with cols[0]:
-            st.write(f"📎 **{fname}**  —  id `{mid[:8]}..`")
-        exists_in_db = False
-        try:
-            # não temos hash sem baixar; usamos marcador de sessão para não repetir na mesma sessão
-            exists_in_db = fh_preview in st.session_state["ingested_hashes"]
-        except Exception:
-            exists_in_db = False
-        with cols[1]:
-            st.write("Status:", "🟡 já ingerido (sessão)" if exists_in_db else "🟢 novo")
-        with cols[2]:
-            disabled = exists_in_db
-            if st.button("➕ Ingerir", key=key, disabled=disabled):
-                # Baixa o PDF real agora
-                fetched = gmail_fetch_one_pdf(service, mid, att_id, fname)
-                if not fetched:
-                    st.error("Não consegui baixar este anexo (PDF).")
+                if not items:
+                    st.info("Nenhum anexo PDF encontrado com esse filtro.")
                 else:
-                    real_fname, pdfb = fetched
-                    real_hash = sha1(pdfb)
+                    st.success(f"Encontrados {len(items)} anexo(s) PDF.")
+            except Exception as e:
+                st.error(f"Erro na busca: {e}")
 
-                    # Evita duplicidade de verdade consultando banco
-                    if db_already_ingested(real_hash):
-                        st.session_state["ingested_hashes"].add(fh_preview)
-                        st.warning("Esta nota já está no banco.")
-                    else:
-                        res = process_one_pdf(pdfb, default_map, _pwd_sig=_PWD_SIG)
-                        if not res.get("ok"):
-                            st.error(res.get("error", "Falha no processamento"))
-                        else:
-                            db_save_ingestion(res, real_hash, real_fname)
-                            # Guarda na sessão para aparecer no Consolidado
-                            st.session_state["ingested_results"].append(res)
-                            st.session_state["ingested_hashes"].add(fh_preview)
-                            st.success("Nota ingerida no banco (e adicionada ao consolidado da sessão).")
-                            st.toast(f"Ingerido: {real_fname}")
+        if cbtn2.button("🧹 Limpar resultados"):
+            st.session_state["gmail_items"] = []
+            st.session_state["ingested_hashes"] = set()
+
+        items = st.session_state.get("gmail_items") or []
+        if items:
+            st.write("**Anexos encontrados:**")
+            for idx, it in enumerate(items):
+                mid = it["message_id"]
+                att_id = it["attachment_id"]
+                fname = it.get("filename") or f"{mid}.pdf"
+
+                key = f"ing_{mid}_{att_id}_{idx}"
+
+                cols = st.columns([3,1.2,1.2])
+                with cols[0]:
+                    st.write(f"📎 **{fname}** — id `{mid[:10]}…`")
+                with cols[1]:
+                    st.write("Pronto p/ ingerir")
+                with cols[2]:
+                    if st.button("➕ Ingerir", key=key):
+                        try:
+                            fn, pdfb = gmail_fetch_one_pdf(service, mid, att_id, fname)
+                            fh = sha1(pdfb)
+                            # Evita reprocessar na mesma sessão
+                            if fh in st.session_state["ingested_hashes"]:
+                                st.warning("Esse anexo já foi ingerido nesta sessão.")
+                            else:
+                                res = process_one_pdf(pdfb, name_to_ticker_map, _pwd_sig=_PWD_SIG)
+                                if not res.get("ok"):
+                                    st.error(res.get("error", "Falha no processamento"))
+                                else:
+                                    # salva no banco (verifica duplicata no DB)
+                                    exists = db_already_ingested(fh)
+                                    if exists:
+                                        st.info("Essa nota já existia no banco (hash duplicado). Não foi inserida novamente.")
+                                    else:
+                                        db_save_ingestion(res, fh, fn)
+                                        st.session_state["ingested_hashes"].add(fh)
+                                        st.success(f"Ingerido: **{fn}** — {len(res.get('out', pd.DataFrame()))} linha(s).")
+                                        # Preview compacto
+                                        try:
+                                            df_prev = res["out"][["Data do Pregão","Ativo","Operação","Quantidade","Valor","Custos","Total"]]
+                                            st.dataframe(df_prev, use_container_width=True, hide_index=True)
+                                        except Exception:
+                                            pass
+                        except Exception as e:
+                            st.error(f"Erro ao baixar/ingerir: {e}")
 
     with st.expander("Desconectar Gmail"):
         if st.button("Remover tokens salvos"):
@@ -1171,18 +1155,13 @@ def style_result_df(df: pd.DataFrame) -> Any:
         return "text-align:center"
     if "Operação" in df.columns:
         try:
-            sty = sty.map(op_style, subset=pd.IndexSlice[:, ["Operação"]])  # pandas >= 2.3
+            sty = sty.map(op_style, subset=pd.IndexSlice[:, ["Operação"]])
         except Exception:
-            sty = sty.applymap(op_style, subset=["Operação"])  # fallback
+            sty = sty.applymap(op_style, subset=["Operação"])
     sty = sty.set_properties(**{"text-align":"center"})
-    sty = sty.set_table_styles([
-        {"selector":"th", "props":[("text-align","center")]}
-    ], overwrite=False)
+    sty = sty.set_table_styles([{"selector":"th", "props":[("text-align","center")]}], overwrite=False)
     if cols_emphasis:
-        sty = sty.set_properties(
-            subset=cols_emphasis,
-            **{"border-left":"1px solid #e5e7eb","border-right":"1px solid #e5e7eb"}
-        )
+        sty = sty.set_properties(subset=cols_emphasis, **{"border-left":"1px solid #e5e7eb","border-right":"1px solid #e5e7eb"})
     sty = sty.set_properties(**{"border":"1px solid #e5e7eb"})
     return sty
 
@@ -1358,10 +1337,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="big-title">Calc B3 – Nota de Corretagem</div>', unsafe_allow_html=True)
-st.markdown(f'<div class="subtitle">Consolidado de notas B3/XP, carteira e movimentações com PM, patrimônio e cotações em tempo quase real. <span class="muted">Build {APP_BUILD}</span></div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Consolidado de notas B3/XP, carteira e movimentações com PM, patrimônio e cotações em tempo quase real.</div>', unsafe_allow_html=True)
 
-# ======= Estado base para consolidado por Gmail (antes de sidebar) ===========
-st.session_state.setdefault("ingested_results", [])
+# -------- Mapa padrão (pode ser ajustado via CSV na sidebar) --------
+default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}
 
 with st.sidebar:
     st.header("Opções")
@@ -1388,8 +1367,6 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Mapeamento opcional Nome→Ticker")
     st.write("Forneça um CSV `Nome,Ticker` se sua nota vier sem ticker.")
-    # Define default_map ANTES do Gmail
-    default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}
     map_file = st.file_uploader("Upload CSV de mapeamento (opcional)", type=["csv"], key="map_csv")
     if map_file is not None:
         try:
@@ -1402,8 +1379,8 @@ with st.sidebar:
             st.warning(f"Falha ao ler CSV: {e}")
 
     st.markdown("---")
-    # Importador Gmail agora usa default_map já ajustado
-    gmail_import_notes()
+    # Gmail na sidebar, passando o mapa atualizado
+    gmail_import_notes(name_to_ticker_map=default_map)
 
 # ========================= Uploads & processamento ============================
 uploads = st.file_uploader("Carregue um ou mais PDFs da B3/XP", type=["pdf"], accept_multiple_files=True, key="pdfs")
@@ -1435,11 +1412,10 @@ with st.expander("🔐 Diagnóstico PDF com senha"):
 
 # ================================ Consolidado =================================
 st.markdown("## 📚 Consolidado")
-session_ing = st.session_state.get("ingested_results", [])
-if not results and not session_ing:
+if not results:
     st.info("Envie um ou mais arquivos PDF para ver o consolidado (ou use o importador Gmail na barra lateral).")
 else:
-    valid_outs = [r["out"] for r in results if r.get("ok")] + [r["out"] for r in session_ing if r.get("ok")]
+    valid_outs = [r["out"] for r in results if r.get("ok")]
     if not valid_outs:
         st.warning("Nenhuma nota válida processada.")
     else:
@@ -1475,16 +1451,16 @@ else:
         allow_dups = st.checkbox("Permitir redundância de notas", value=False)
         if st.button("➕ Adicionar todas as notas visíveis"):
             inserted = 0; duplicated = 0
-            for r in (results + session_ing):
+            for r in results:
                 if not r.get("ok"):
                     continue
-                fh = r.get("filehash") or sha1((r.get("text") or "").encode())  # fallback p/ itens do Gmail sem hash armazenado
+                fh = r["filehash"]
                 if db_already_ingested(fh) and not allow_dups:
                     duplicated += 1
                     continue
                 if db_already_ingested(fh) and allow_dups:
                     fh = f"{fh}:dup:{int(_now())}"
-                db_save_ingestion(r, fh, r.get("filename") or "gmail.pdf")
+                db_save_ingestion(r, fh, r["filename"])
                 inserted += 1
             if inserted:
                 st.success(f"{inserted} nota(s) adicionada(s) ao banco.")
