@@ -24,10 +24,8 @@ APP_BUILD = "gmail-v5-2025-10-05"
 
 # --- Fallbacks p/ versões antigas do Streamlit ---
 def _link_button(label: str, url: str):
-    try:
-        st.link_button(label, url)
-    except Exception:
-        st.markdown(f"[{label}]({url})")
+    # força abrir na MESMA aba (evita você ficar na aba antiga sem o ?code=)
+    st.markdown(f"[{label}]({url})", unsafe_allow_html=True)
 
 def _get_query_params():
     try:
@@ -921,6 +919,41 @@ def gmail_handle_oauth_callback():
     except Exception as e:
         st.error(f"Falha na troca de token: {e}")
 
+def gmail_finalize_with_code(code_or_url: str):
+    import urllib.parse as up
+    raw = (code_or_url or "").strip()
+    if not raw:
+        st.error("Cole o código ou a URL de retorno.")
+        return False
+    # aceita URL completa ou apenas o valor do code
+    if "code=" in raw:
+        try:
+            parsed = up.urlparse(raw)
+            qs = up.parse_qs(parsed.query)
+            code = (qs.get("code") or [""])[0]
+        except Exception:
+            code = ""
+    else:
+        code = raw
+    if not code:
+        st.error("Não consegui extrair o parâmetro 'code'.")
+        return False
+
+    cfg = _gmail_client_config_from_secrets()
+    if not cfg:
+        st.error("Config do Gmail ausente em st.secrets.")
+        return False
+    flow = Flow.from_client_config(cfg, scopes=GMAIL_SCOPES, redirect_uri=cfg["web"]["redirect_uris"][0])
+    try:
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        gmail_save_creds_to_db(creds)
+        st.success("Gmail conectado com sucesso (via código colado).")
+        return True
+    except Exception as e:
+        st.error(f"Falha ao concluir com código: {e}")
+        return False
+        
 def gmail_list_messages(service, query: str, max_results: int = 20):
     resp = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
     return resp.get("messages", [])
@@ -981,13 +1014,30 @@ def gmail_import_notes():
     gmail_handle_oauth_callback()
     creds = gmail_load_creds_from_db()
 
+    # Painel de debug do OAuth
+    with st.expander("⚙️ Debug OAuth (se a conexão 'sumir')", expanded=False):
+        qp = _get_query_params()
+        st.caption(f"Query params atuais: `{dict(qp)}`")
+        redir = _gmail_client_config_from_secrets().get("web", {}).get("redirect_uris", [""])[0]
+        st.caption(f"Redirect URI esperado (secrets): `{redir}`")
+        pasted = st.text_input("Cole aqui a URL de retorno (com ?code=) OU apenas o valor do code", value="")
+        if st.button("Concluir login com código colado"):
+            gmail_finalize_with_code(pasted)
+
+        st.markdown("""
+**Checklist rápido**
+1. O *Authorized redirect URI* no Google Cloud **deve ser idêntico** ao `redirect_uri` em `st.secrets` (https, domínio exato, com/sem `/` final igual).
+2. O botão acima agora abre na **mesma aba**; finalize o consentimento e você deve voltar com `?code=` na barra.
+3. Se ainda assim não aparecer nada, copie a **URL inteira** da barra (com `?code=`) e cole aqui.
+""")
+
     if not creds:
         url = gmail_auth_url()
         if url:
-            _link_button("Conectar ao Gmail", url)
+            _link_button("Conectar ao Gmail", url)  # mesma aba
         return
 
-    # Permitir editar a query (às vezes seu Gmail tem títulos diferentes)
+    # Permitir editar a query (títulos podem variar)
     default_query = 'from:no-reply@xpi.com.br subject:"XP Investimentos | Nota de Negociação" has:attachment filename:pdf newer_than:2y'
     query = st.text_input("Filtro Gmail (edite se quiser)", value=default_query)
     maxr = st.number_input("Máx. e-mails a buscar", min_value=1, max_value=200, value=20, step=1)
@@ -1009,7 +1059,6 @@ def gmail_import_notes():
                     mid = m.get("id")
                     pdfs = gmail_fetch_pdf_attachments(service, mid)
                     if not pdfs:
-                        # Mostra algo para sabermos que leu o e-mail
                         with st.container():
                             st.write(f"✉️ {mid} — sem PDFs extraíveis")
                         continue
