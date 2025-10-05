@@ -1530,3 +1530,4 @@ total_row = {
     "PM": None,
     "Custo Atual": df_master["Custo Atual"].sum(skipna=True),
     "Total": None,
+}
