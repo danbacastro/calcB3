@@ -102,17 +102,21 @@ def _norm_pwd_variants(raw: str) -> list[str]:
         return []
     outs = []
 
-    outs.append(v)
+    outs.append(v)  # original
+
+    # sem pontuação
     v_nopunct = re.sub(r"[^\w]", "", v, flags=re.UNICODE)
     if v_nopunct and v_nopunct not in outs:
         outs.append(v_nopunct)
 
+    # datas dd/mm/aaaa
     m = re.fullmatch(r"(\d{2})[\/\-\.](\d{2})[\/\-\.](\d{4})", v)
     if m:
         d, mth, y = m.group(1), m.group(2), m.group(3)
         for k in (f"{d}{mth}{y}", f"{y}{mth}{d}"):
             if k not in outs:
                 outs.append(k)
+
     return outs
 
 def _collect_pdf_passwords_from_secrets() -> list[str]:
@@ -176,6 +180,7 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
         for p in pwds:
             try:
                 with pdfplumber.open(io.BytesIO(file_bytes), password=p) as pdf:
+                    # a) strict
                     text = ""
                     for page in pdf.pages:
                         text += (page.extract_text(x_tolerance=1, y_tolerance=1) or "") + "\n"
@@ -185,6 +190,7 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
                 pass
             try:
                 with pdfplumber.open(io.BytesIO(file_bytes), password=p) as pdf:
+                    # b) default
                     text = ""
                     for page in pdf.pages:
                         text += (page.extract_text() or "") + "\n"
@@ -194,6 +200,7 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
                 pass
             try:
                 with pdfplumber.open(io.BytesIO(file_bytes), password=p) as pdf:
+                    # c) reconstructed words
                     chunks = []
                     for page in pdf.pages:
                         words = page.extract_words(use_text_flow=True) or []
@@ -274,12 +281,29 @@ def extract_ticker_from_text(text: str) -> str | None:
             return m.group(1)
     return None
 
+# Heurística por nome (para quando o PDF não traz o ticker)
+NAME2TICKER_PATTERNS = [
+    (_re.compile(r"\bALLOS\b", _re.I), "ALSO3"),
+    (_re.compile(r"\bAMBEV\b", _re.I), "ABEV3"),
+    (_re.compile(r"\b(AREZZO|AZZAS\s*2154)\b", _re.I), "ARZZ3"),
+    (_re.compile(r"\bMARCOPOLO\b", _re.I), "POMO3"),
+    (_re.compile(r"\bMELNICK\b", _re.I), "MELK3"),
+    (_re.compile(r"\bVULCABRAS\b", _re.I), "VULC3"),
+]
+def guess_ticker_from_name(spec: str) -> str | None:
+    s = strip_accents(spec).upper()
+    for rx, tkr in NAME2TICKER_PATTERNS:
+        if rx.search(s):
+            return tkr
+    return None
+
 def derive_from_on_pn(text: str) -> str | None:
     t = strip_accents(text).upper()
     m = _re.search(r"\b([A-Z]{3,6})\s+(ON|PN)\b", t)
     if not m:
         return None
     base, cls = m.group(1), m.group(2)
+    # Observação: este é um último recurso; muitos nomes não batem com o código-base.
     return f"{base}3" if cls == "ON" else f"{base}4"
 
 def clean_b3_tickers(lst) -> list:
@@ -297,45 +321,39 @@ def clean_b3_tickers(lst) -> list:
 # =============================================================================
 # Parsers & headers
 # =============================================================================
-def _normalize_for_parse(text: str) -> str:
-    # remove NBSP, colapsa toda whitespace em 1 espaço
-    t = (text or "").replace("\xa0", " ")
-    t = _re.sub(r"\s+", " ", t)
-    return t
-
 def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     """
-    Parser robusto para a grade 'Negócios realizados' B3.
-    Não depende de quebras de linha e aceita variações de '@' na coluna Obs.(*).
+    Parser B3: robusto a PDF com senha (onde '@' pode sumir/mudar) e a linhas “grudadas”.
+    Captura TODAS as ocorrências no texto inteiro.
     """
-    t = _normalize_for_parse(text)
-
+    text = (text or "").replace("\xa0", " ").replace("\u202f", " ")
     pat = _re.compile(
-        r"(?:\b\d+-)?BOVESPA\s+"
-        r"(?P<cv>C|V)\s+"
-        r"VISTA\s+"
-        r"(?P<spec>.+?)"                # Especificação do título (não-guloso)
-        r"(?:\s+[@#\w]+)?\s+"           # Obs.(*): '@', '@#' etc. (opcional)
-        r"(?P<qty>\d{1,3}(?:\.\d{3})*|\d+)\s+"
+        r"1?-?BOVESPA\s+"
+        r"(?P<cv>[CV])\s+VISTA\s+"
+        r"(?P<spec>.+?)\s+"
+        r"(?:[@#]\s*)?"                        # '@', '@#' ou ausente
+        r"(?P<qty>\d{1,7})\s+"
         r"(?P<price>\d{1,3},\d{2})\s+"
         r"(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})\s+"
         r"(?P<dc>[CD])",
-        _re.IGNORECASE | _re.DOTALL
+        flags=_re.IGNORECASE | _re.DOTALL
     )
 
     recs = []
-    for m in pat.finditer(t):
+    for m in pat.finditer(text):
         cv = m.group("cv").upper()
         spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
-        qty = int(m.group("qty").replace(".", ""))
+        qty = int(m.group("qty"))
         price = parse_brl_number(m.group("price"))
         value = parse_brl_number(m.group("value"))
         dc = m.group("dc").upper()
 
-        ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(spec + " " + m.group(0))
+        ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(m.group(0))
         if not ticker:
             key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
-            ticker = name_to_ticker_map.get(key) or derive_from_on_pn(spec) or ""
+            ticker = name_to_ticker_map.get(key)
+        if not ticker:
+            ticker = guess_ticker_from_name(spec) or derive_from_on_pn(spec) or ""
 
         recs.append({
             "Ativo": ticker, "Nome": spec,
@@ -343,36 +361,35 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
             "Quantidade": qty, "Preço_Unitário": price,
             "Valor": value if cv == "C" else -value, "Sinal_DC": dc
         })
+
     return pd.DataFrame(recs)
 
 def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
-    """
-    Fallback bem permissivo: procura 'Compra/Venda ... qty price value'.
-    """
-    t = _normalize_for_parse(text)
+    text = (text or "").replace("\xa0", " ").replace("\u202f", " ")
     pat = _re.compile(
-        r"(?P<cv>\bC\b|\bV\b|\bCompra\b|\bVenda\b)\s+"
-        r"(?P<spec>.+?)"
-        r"(?:\s+[@#\w]+)?\s+"
-        r"(?P<qty>\d{1,3}(?:\.\d{3})*|\d+)\s+"
+        r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?"
+        r"(?P<spec>.+?)\s+"
+        r"(?:[@#]\s*)?(?P<qty>\d{1,7})\s+"
         r"(?P<price>\d{1,3},\d{2})\s+"
         r"(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})",
-        _re.IGNORECASE | _re.DOTALL
+        flags=_re.IGNORECASE | _re.DOTALL
     )
 
     recs = []
-    for m in pat.finditer(t):
+    for m in pat.finditer(text):
         cv_raw = m.group("cv").strip().upper()
         cv = "C" if cv_raw.startswith("C") else "V"
         spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
-        qty = int(m.group("qty").replace(".", ""))
+        qty = int(m.group("qty"))
         price = parse_brl_number(m.group("price"))
         value = parse_brl_number(m.group("value"))
 
         ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(m.group(0))
         if not ticker:
             key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
-            ticker = name_to_ticker_map.get(key) or derive_from_on_pn(spec) or ""
+            ticker = name_to_ticker_map.get(key)
+        if not ticker:
+            ticker = guess_ticker_from_name(spec) or derive_from_on_pn(spec) or ""
 
         recs.append({
             "Ativo": ticker, "Nome": spec,
@@ -687,7 +704,7 @@ def db_save_ingestion(res: dict, filehash: str, filename: str):
     ))
     fees = res.get("fees") or {}
     for k, v in fees.items():
-        if k.startswith("_"):
+        if k.startswith("_"): 
             continue
         cur.execute("INSERT INTO fees_components (filehash, key, value) VALUES (?,?,?)", (filehash, k, float(v)))
     df_raw = res.get("df_valid")
@@ -709,7 +726,7 @@ def db_save_ingestion(res: dict, filehash: str, filename: str):
                 VALUES (?,?,?,?,?,?,?,?,?)
             """, (
                 filehash, r["Data do Pregão"], r["Ativo"], r["Operação"],
-                int(r["Quantidade"]), float(r["Valor"]),
+                int(r["Quantidade"]), float(r["Valor"]), 
                 float(r["Preço Médio"]) if pd.notna(r["Preço Médio"]) else None,
                 float(r["Custos"]), float(r["Total"])
             ))
@@ -822,7 +839,7 @@ def _gmail_client_config_from_secrets() -> dict:
             "client_secret": conf["client_secret"],
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [conf["redirect_uri"]],
+            "redirect_uris": [conf["web"]["redirect_uris"][0] if isinstance(conf.get("redirect_uris"), list) else conf["redirect_uri"]],
         }
     }
 
@@ -1118,9 +1135,7 @@ def style_result_df(df: pd.DataFrame) -> Any:
         except Exception:
             sty = sty.applymap(op_style, subset=["Operação"])
     sty = sty.set_properties(**{"text-align":"center"})
-    sty = sty.set_table_styles([
-        {"selector":"th", "props":[("text-align","center")]}
-    ], overwrite=False)
+    sty = sty.set_table_styles([{"selector":"th", "props":[("text-align","center")]}], overwrite=False)
     if cols_emphasis:
         sty = sty.set_properties(
             subset=cols_emphasis,
@@ -1209,7 +1224,6 @@ def debug_probe_pdf_passwords(pdf_bytes: bytes) -> pd.DataFrame:
     rows = []
     pwds = [None] + _collect_pdf_passwords_from_secrets()
 
-    # PyMuPDF
     if fitz:
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -1238,7 +1252,6 @@ def debug_probe_pdf_passwords(pdf_bytes: bytes) -> pd.DataFrame:
         except Exception as e:
             rows.append(["PyMuPDF", "-", "-", False, 0, f"erro abrir: {e}"])
 
-    # pdfplumber
     if pdfplumber:
         ok = False
         for i, p in enumerate(pwds):
@@ -1254,7 +1267,6 @@ def debug_probe_pdf_passwords(pdf_bytes: bytes) -> pd.DataFrame:
         if not ok:
             rows.append(["pdfplumber", "?", "-", False, 0, "não abriu ou sem texto"])
 
-    # PyPDF2
     if PyPDF2:
         try:
             reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
@@ -1333,7 +1345,7 @@ with st.sidebar:
     st.markdown("---")
     gmail_import_notes()
 
-default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}
+default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}  # opcional, continua valendo
 if map_file is not None:
     try:
         mdf = pd.read_csv(map_file)
@@ -1414,7 +1426,7 @@ else:
         if st.button("➕ Adicionar todas as notas visíveis"):
             inserted = 0; duplicated = 0
             for r in results:
-                if not r.get("ok"):
+                if not r.get("ok"): 
                     continue
                 fh = r["filehash"]
                 if db_already_ingested(fh) and not allow_dups:
