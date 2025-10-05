@@ -19,6 +19,8 @@ from time import time as _now
 import pandas as pd
 import streamlit as st
 
+APP_BUILD = "gmail-v5-2025-10-05"
+
 # --- Auto refresh invisível (30s) ---
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -28,6 +30,31 @@ except Exception:
 AUTO_REFRESH_MS = 30_000  # 30s
 if st_autorefresh:
     st_autorefresh(interval=AUTO_REFRESH_MS, limit=None, key="auto_refresh_30s")
+
+# Fallbacks p/ Streamlit antigo
+def _link_button(label: str, url: str):
+    try:
+        st.link_button(label, url)  # 1.33+
+    except Exception:
+        st.markdown(f"[{label}]({url})")
+
+def _get_query_params():
+    try:
+        return dict(st.query_params)  # 1.29+
+    except Exception:
+        try:
+            return st.experimental_get_query_params()
+        except Exception:
+            return {}
+
+def _clear_query_params():
+    try:
+        st.query_params.clear()
+    except Exception:
+        try:
+            st.experimental_set_query_params()  # limpa
+        except Exception:
+            pass
 
 # --- PDF parsers
 try:
@@ -100,8 +127,7 @@ def _norm_pwd_variants(raw: str) -> list[str]:
     v = str(raw or "").strip()
     if not v:
         return []
-    outs = []
-    outs.append(v)  # original
+    outs = [v]
     v_nopunct = re.sub(r"[^\w]", "", v, flags=re.UNICODE)
     if v_nopunct and v_nopunct not in outs:
         outs.append(v_nopunct)
@@ -109,7 +135,8 @@ def _norm_pwd_variants(raw: str) -> list[str]:
     if m:
         d, mth, y = m.group(1), m.group(2), m.group(3)
         for k in (f"{d}{mth}{y}", f"{y}{mth}{d}"):
-            if k not in outs: outs.append(k)
+            if k not in outs:
+                outs.append(k)
     return outs
 
 def _collect_pdf_passwords_from_secrets() -> list[str]:
@@ -123,21 +150,35 @@ def _collect_pdf_passwords_from_secrets() -> list[str]:
             if v is None:
                 return None
         return v
+
     candidates = []
     try:
-        for path in [("pdf_password",), ("pdf_passwords",), ("pdf","password"), ("pdf","passwords")]:
+        for path in [("pdf_password",), ("pdf_passwords",)]:
             v = _pull(path)
-            if v is None: continue
+            if v is None:
+                continue
             if isinstance(v, (list, tuple, set)):
                 candidates += [str(x) for x in v if str(x).strip()]
             else:
-                if str(v).strip(): candidates.append(str(v))
+                if str(v).strip():
+                    candidates.append(str(v))
+        for path in [("pdf","password"), ("pdf","passwords")]:
+            v = _pull(path)
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple, set)):
+                candidates += [str(x) for x in v if str(x).strip()]
+            else:
+                if str(v).strip():
+                    candidates.append(str(v))
     except Exception:
         pass
+
     final = []
     for raw in candidates:
         for v in _norm_pwd_variants(raw):
-            if v not in final: final.append(v)
+            if v not in final:
+                final.append(v)
     return final
 
 _PWD_LIST = _collect_pdf_passwords_from_secrets()
@@ -147,11 +188,17 @@ _PWD_SIG = sha1("||".join(_PWD_LIST).encode()) if _PWD_LIST else ""
 # PDF → texto (com suporte a senha)
 # =============================================================================
 def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = None) -> tuple[str, str]:
+    """
+    Tenta extrair texto usando pdfplumber, PyMuPDF (fitz) e PyPDF2.
+    Suporta PDFs protegidos com senha (lista de tentativas).
+    Retorna (texto, "engine usada").
+    """
     pwds = [None] + (passwords or [])
 
-    # 1) pdfplumber
+    # 1) pdfplumber (tenta senhas na ordem)
     if pdfplumber is not None:
         for p in pwds:
+            # a) strict tolerances
             try:
                 with pdfplumber.open(io.BytesIO(file_bytes), password=p) as pdf:
                     text = ""
@@ -161,6 +208,7 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
                         return text, f"pdfplumber (strict tol=1/1){' + pwd' if p else ''}"
             except Exception:
                 pass
+            # b) default
             try:
                 with pdfplumber.open(io.BytesIO(file_bytes), password=p) as pdf:
                     text = ""
@@ -170,6 +218,7 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
                         return text, f"pdfplumber (default tol){' + pwd' if p else ''}"
             except Exception:
                 pass
+            # c) reconstructed words (quando tabelas "esfarelam")
             try:
                 with pdfplumber.open(io.BytesIO(file_bytes), password=p) as pdf:
                     chunks = []
@@ -201,8 +250,6 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
             try:
                 doc = fitz.open(stream=file_bytes, filetype="pdf", password=(p if p else None))
                 text = "\n".join(pg.get_text("text") for pg in doc)
-                if not text.strip():
-                    text = "\n".join(pg.get_text() for pg in doc)
                 if text.strip():
                     return text, f"PyMuPDF{' + pwd' if p else ''}"
             except Exception:
@@ -213,12 +260,20 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
         try:
             reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
             if getattr(reader, "is_encrypted", False):
+                opened = False
                 for p in pwds:
                     try:
-                        if reader.decrypt("" if p is None else p) == 1:
+                        res = reader.decrypt("" if p is None else p)
+                        if res == 1:
+                            opened = True
                             break
                     except Exception:
                         continue
+                if not opened:
+                    try:
+                        reader.decrypt("")
+                    except Exception:
+                        pass
             text = ""
             for page in reader.pages:
                 text += (page.extract_text() or "") + "\n"
@@ -230,13 +285,15 @@ def extract_text_from_pdf(file_bytes: bytes, passwords: Optional[list[str]] = No
     return "", "none"
 
 # =============================================================================
-# Tickers
+# Tickers (detecção)
 # =============================================================================
 import re as _re
 FII_EXACT = _re.compile(r"\b([A-Z]{4}11[A-Z]?)\b")
 WITH_11   = _re.compile(r"\b([A-Z]{3,6}11[A-Z]?)\b")
 SHARES    = _re.compile(r"\b([A-Z]{4}[3456][A-Z]?)\b")
 BDR_2D    = _re.compile(r"\b([A-Z]{4}\d{2}[A-Z]?)\b")
+
+AUX_BAD = {"ON","PN","S/A","SA","NM","N1","N2","N3","ED","EDNM","ED/NM","ED-NM","ED,","NM,","EJ","PNB","PNC"}
 
 def extract_ticker_from_text(text: str) -> str | None:
     t = strip_accents(text).upper()
@@ -254,6 +311,39 @@ def derive_from_on_pn(text: str) -> str | None:
     base, cls = m.group(1), m.group(2)
     return f"{base}3" if cls == "ON" else f"{base}4"
 
+def _guess_ticker_from_spec_name(spec: str) -> str | None:
+    t = strip_accents(spec).upper()
+    t = t.replace("\xa0", " ")
+    # remove tokens auxiliares
+    for bad in AUX_BAD:
+        t = re.sub(rf"\b{re.escape(bad)}\b", " ", t)
+    t = re.sub(r"[^A-Z0-9 ]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # casos específicos comuns
+    special = {
+        "AMBEV": "ABEV3",
+        "ALLOS": "ALLOS3",
+        "VULCABRAS": "VULC3",
+        "MARCOPOLO": "POMO3",
+        "MELNICK": "MELK3",
+        "AZZA": "AZZA3",
+        "AZZAS": "AZZA3",
+        "PETRORECSA": "RECV3",
+        "EVEN": "EVEN3",
+    }
+    for k, v in special.items():
+        if re.search(rf"\b{k}\b", t):
+            return v
+
+    # tenta tokens 3-6 letras (não numéricos)
+    tokens = [w for w in t.split() if w.isalpha() and 3 <= len(w) <= 6]
+    if tokens:
+        base = tokens[0][:6]
+        # heurística mais frequente: ON -> 3, PN -> 4 (já removemos ON/PN)
+        return f"{base[:6]}3" if len(base) >= 3 else None
+    return None
+
 def clean_b3_tickers(lst) -> list:
     out = []
     for t in lst:
@@ -270,13 +360,16 @@ def clean_b3_tickers(lst) -> list:
 # Parsers & headers
 # =============================================================================
 def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
+    # normaliza NBSP e comprime espaços
     text = text.replace("\xa0", " ")
     lines = text.splitlines()
+    # menos restrição no filtro de linhas (alguns extratores mudam quebras)
     trade_lines = [l for l in lines if ("BOVESPA" in l and "VISTA" in l)]
 
+    # aceita "@", "@#", "@*" etc. e quantidade com "." milhar
     pat = _re.compile(
-        r"BOVESPA\s+(?P<cv>[CV])\s+VISTA\s+(?P<spec>.+?)@\s+"
-        r"(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+"
+        r"BOVESPA\s+(?P<cv>[CV])\s+VISTA\s+(?P<spec>.+?)@\s*[#\*]?\s+"
+        r"(?P<qty>[\d\.]+)\s+(?P<price>\d+,\d+)\s+"
         r"(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<dc>[CD])"
     )
 
@@ -285,17 +378,19 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
         for m in pat.finditer(line):
             cv = m.group("cv")
             spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
-            qty = int(m.group("qty"))
+            qty = int(m.group("qty").replace(".", ""))
             price = parse_brl_number(m.group("price"))
             value = parse_brl_number(m.group("value"))
             dc = m.group("dc")
 
-            ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
-            if not ticker:
-                key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
-                ticker = name_to_ticker_map.get(key)
-            if not ticker:
-                ticker = derive_from_on_pn(spec) or ""
+            ticker = (
+                extract_ticker_from_text(spec)
+                or extract_ticker_from_text(line)
+                or name_to_ticker_map.get(_re.sub(r"[^A-Z]", "", strip_accents(spec).upper()), "")
+                or _guess_ticker_from_spec_name(spec)
+                or derive_from_on_pn(spec)
+                or ""
+            )
 
             recs.append({
                 "Ativo": ticker, "Nome": spec,
@@ -303,14 +398,15 @@ def parse_trades_b3style(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
                 "Quantidade": qty, "Preço_Unitário": price,
                 "Valor": value if cv == "C" else -value, "Sinal_DC": dc
             })
+
     return pd.DataFrame(recs)
 
 def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFrame:
     text = text.replace("\xa0", " ")
-    lines = [l for l in text.splitlines() if "@" in l and _re.search(r"\d{1,3}(?:\.\d{3})*,\d{2}", l)]
+    lines = [l for l in text.splitlines() if _re.search(r"@\s*[#\*]?\s+\d+", l) and _re.search(r"\d{1,3}(?:\.\d{3})*,\d{2}", l)]
     pat = _re.compile(
-        r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?(?P<spec>.+?)@\s+"
-        r"(?P<qty>\d+)\s+(?P<price>\d+,\d+)\s+"
+        r"(?P<cv>\b[CV]\b|\bCompra\b|\bVenda\b).*?(?P<spec>.+?)@\s*[#\*]?\s+"
+        r"(?P<qty>[\d\.]+)\s+(?P<price>\d+,\d+)\s+"
         r"(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})"
     )
 
@@ -320,16 +416,18 @@ def parse_trades_generic_table(text: str, name_to_ticker_map: dict) -> pd.DataFr
             cv_raw = m.group("cv").strip().upper()
             cv = "C" if cv_raw.startswith("C") else "V"
             spec = _re.sub(r"\s+", " ", m.group("spec")).strip()
-            qty = int(m.group("qty"))
+            qty = int(m.group("qty").replace(".", ""))
             price = parse_brl_number(m.group("price"))
             value = parse_brl_number(m.group("value"))
 
-            ticker = extract_ticker_from_text(spec) or extract_ticker_from_text(line)
-            if not ticker:
-                key = _re.sub(r"[^A-Z]", "", strip_accents(spec).upper())
-                ticker = name_to_ticker_map.get(key)
-            if not ticker:
-                ticker = derive_from_on_pn(spec) or ""
+            ticker = (
+                extract_ticker_from_text(spec)
+                or extract_ticker_from_text(line)
+                or name_to_ticker_map.get(_re.sub(r"[^A-Z]", "", strip_accents(spec).upper()), "")
+                or _guess_ticker_from_spec_name(spec)
+                or derive_from_on_pn(spec)
+                or ""
+            )
 
             recs.append({
                 "Ativo": ticker, "Nome": spec,
@@ -644,7 +742,7 @@ def db_save_ingestion(res: dict, filehash: str, filename: str):
     ))
     fees = res.get("fees") or {}
     for k, v in fees.items():
-        if k.startswith("_"): 
+        if k.startswith("_"):
             continue
         cur.execute("INSERT INTO fees_components (filehash, key, value) VALUES (?,?,?)", (filehash, k, float(v)))
     df_raw = res.get("df_valid")
@@ -663,10 +761,10 @@ def db_save_ingestion(res: dict, filehash: str, filename: str):
         for _, r in df_out.iterrows():
             cur.execute("""
                 INSERT INTO trades_agg (filehash, data_pregao, ativo, operacao, quantidade, valor, preco_medio, custos, total)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?)
             """, (
                 filehash, r["Data do Pregão"], r["Ativo"], r["Operação"],
-                int(r["Quantidade"]), float(r["Valor"]), 
+                int(r["Quantidade"]), float(r["Valor"]),
                 float(r["Preço Médio"]) if pd.notna(r["Preço Médio"]) else None,
                 float(r["Custos"]), float(r["Total"])
             ))
@@ -679,6 +777,7 @@ def _ymd_from_br(d: str) -> str | None:
         return None
 
 def db_positions_dataframe(as_of: str | None = None, filtro_ativo: str | None = None) -> pd.DataFrame:
+    """Posição e PM até a data (inclusive)."""
     conn = db_connect()
     where = " WHERE ativo <> '' "
     params = []
@@ -720,6 +819,7 @@ def db_positions_dataframe(as_of: str | None = None, filtro_ativo: str | None = 
     return pd.DataFrame(rows).sort_values("Ativo")
 
 def db_rollup_net_total_by_ticker(as_of: str | None = None, filtro_ativo: str | None = None) -> pd.DataFrame:
+    """TOTAL líquido por ticker: compras somam, vendas subtraem."""
     conn = db_connect()
     where = " WHERE ativo <> '' "
     params = []
@@ -828,7 +928,8 @@ def gmail_save_creds_to_db(creds: Credentials):
         " ".join(GMAIL_SCOPES),
         getattr(creds, "expiry", None).isoformat() if getattr(creds, "expiry", None) else None,
     ))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 def gmail_clear_tokens():
     conn = db_connect()
@@ -850,12 +951,12 @@ def gmail_auth_url() -> Optional[str]:
     return auth_url
 
 def gmail_handle_oauth_callback():
-    params = st.query_params
+    params = _get_query_params()
     code = params.get("code")
-    if not code:
-        return
     if isinstance(code, list):
         code = code[0]
+    if not code:
+        return
     cfg = _gmail_client_config_from_secrets()
     if not cfg:
         st.warning("Config do Gmail ausente em st.secrets.")
@@ -865,53 +966,18 @@ def gmail_handle_oauth_callback():
         flow.fetch_token(code=code)
         creds = flow.credentials
         gmail_save_creds_to_db(creds)
-        try:
-            st.query_params.clear()
-        except Exception:
-            pass
+        _clear_query_params()
         st.success("Gmail conectado com sucesso.")
     except Exception as e:
         st.error(f"Falha na troca de token: {e}")
 
-def gmail_list_messages(service, query: str, max_results: int = 50):
-    msgs, token = [], None
-    while len(msgs) < max_results:
-        resp = service.users().messages().list(
-            userId="me",
-            q=query,
-            maxResults=min(100, max_results - len(msgs)),
-            pageToken=token,
-            includeSpamTrash=True
-        ).execute()
-        msgs.extend(resp.get("messages", []))
-        token = resp.get("nextPageToken")
-        if not token:
-            break
-    return msgs
-
-def _filename_from_part(part: dict, default_name: str) -> str:
-    filename = (part.get("filename") or "").strip()
-    headers = part.get("headers") or []
-    if not filename:
-        for h in headers:
-            name = (h.get("name") or "").lower()
-            val = h.get("value") or ""
-            if name == "content-disposition" and "filename=" in val:
-                fn = val.split("filename=", 1)[1].strip().strip('"').strip("'")
-                if fn: filename = fn; break
-        if not filename:
-            for h in headers:
-                name = (h.get("name") or "").lower()
-                val = h.get("value") or ""
-                if name == "content-type" and "name=" in val:
-                    fn = val.split("name=", 1)[1].strip().strip('"').strip("'")
-                    if fn: filename = fn; break
-    return filename or default_name
+def gmail_list_messages(service, query: str, max_results: int = 20):
+    resp = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
+    return resp.get("messages", [])
 
 def gmail_fetch_pdf_attachments(service, message_id: str):
     """Retorna lista [(filename, bytes)] apenas de PDFs do email message_id.
-       Aceita tanto parts com attachmentId quanto inline body.data.
-    """
+       Aceita tanto body.data inline quanto attachmentId."""
     def _b64url_to_bytes(s: str) -> bytes:
         if not s:
             return b""
@@ -922,54 +988,42 @@ def gmail_fetch_pdf_attachments(service, message_id: str):
     msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
     payload = msg.get("payload", {}) or {}
 
-    def _try_collect(part: dict, default_name: str):
+    def _add_from_part(part, default_name: str):
         if not isinstance(part, dict):
             return
+        filename = (part.get("filename") or default_name).strip()
         mime = (part.get("mimeType") or "").lower()
         body = part.get("body", {}) or {}
-        filename = _filename_from_part(part, default_name)
-
-        is_pdf = (mime == "application/pdf") or filename.lower().endswith(".pdf")
-        if not is_pdf:
-            return
-
-        # 1) Caso clássico: attachmentId presente
+        data_inline = body.get("data")
         att_id = body.get("attachmentId")
+
+        is_pdf_like = (mime == "application/pdf") or filename.lower().endswith(".pdf")
+        if not is_pdf_like:
+            return
         if att_id:
             att = service.users().messages().attachments().get(
                 userId="me", messageId=message_id, id=att_id
             ).execute()
             data = att.get("data")
             if data:
-                out.append((filename, _b64url_to_bytes(data)))
-                return
+                out.append((filename or default_name, _b64url_to_bytes(data)))
+        elif data_inline:
+            out.append((filename or default_name, _b64url_to_bytes(data_inline)))
 
-        # 2) Caso inline: body.data presente (sem attachmentId)
-        data_inline = body.get("data")
-        if data_inline:
-            out.append((filename, _b64url_to_bytes(data_inline)))
-            return
+    # raiz
+    _add_from_part(payload, f"{message_id}.pdf")
 
-    # checa raiz e partes recursivamente
-    _try_collect(payload, default_name=f"{message_id}.pdf")
-
+    # walk
     def _walk(parts):
-        for idx, p in enumerate(parts or []):
-            _try_collect(p, default_name=f"{message_id}_{idx}.pdf")
+        for p in parts or []:
+            _add_from_part(p, f"{message_id}.pdf")
             if p.get("parts"):
                 _walk(p.get("parts"))
-
     _walk(payload.get("parts"))
     return out
 
 def gmail_import_notes():
-    XP_NOTA_QUERY = (
-        'in:anywhere '
-        '(from:xpi.com.br OR from:xpinc.com OR from:xp.com.br OR from:no-reply@xpi.com.br) '
-        '(subject:"Nota de Negociação" OR subject:"Nota de Negociacao" OR subject:Negociação OR subject:Negociacao OR subject:Nota) '
-        'has:attachment filename:pdf newer_than:3y'
-    )
-    XP_NOTA_FALLBACK = 'in:anywhere (from:xpi.com.br OR from:xpinc.com) has:attachment filename:pdf newer_than:3y'
+    XP_NOTA_QUERY = '(from:no-reply@xpi.com.br) (subject:"Nota de Negociação" OR subject:"Nota de Negociacao") has:attachment filename:pdf newer_than:2y'
 
     st.markdown("### 📧 Importar do Gmail")
     cfg_ok = bool(_gmail_client_config_from_secrets())
@@ -977,70 +1031,60 @@ def gmail_import_notes():
         st.info("Configure os segredos `[gmail]` em *Secrets* para habilitar o login.")
         return
 
+    # Trata callback OAuth se existir ?code=
     gmail_handle_oauth_callback()
     creds = gmail_load_creds_from_db()
 
     if not creds:
         url = gmail_auth_url()
         if url:
-            st.link_button("Conectar ao Gmail", url)
+            _link_button("Conectar ao Gmail", url)
         return
 
+    st.caption(f"Filtro Gmail aplicado: `{XP_NOTA_QUERY}`")
+    query = XP_NOTA_QUERY
+    maxr = st.number_input("Máx. e-mails a buscar", min_value=1, max_value=200, value=20, step=1)
+
     try:
-        svc = build("gmail", "v1", credentials=creds)
-        profile = svc.users().getProfile(userId="me").execute()
-        st.caption(f"Conectado como: **{profile.get('emailAddress','(desconhecido)')}**")
-    except Exception:
-        svc = build("gmail", "v1", credentials=creds)
+        service = build("gmail", "v1", credentials=creds)
+    except Exception as e:
+        st.error(f"Não foi possível iniciar o cliente do Gmail: {e}")
+        return
 
-    st.caption("Consulta padrão (editável):")
-    query = st.text_input("Filtro Gmail", XP_NOTA_QUERY, key="gmail_query")
-    maxr = st.number_input("Máx. e-mails a buscar", min_value=1, max_value=500, value=100, step=1)
-
-    cols = st.columns([1,1,1])
-    do_search = cols[0].button("🔎 Buscar e-mails")
-    do_fb     = cols[1].button("🔁 Fallback")
-    do_any    = cols[2].button("🧪 Amplo: qualquer PDF (2y)")
-
-    if do_fb:
-        query = XP_NOTA_FALLBACK
-        st.info("Usando fallback com assunto liberado.")
-
-    if do_any:
-        query = 'in:anywhere has:attachment filename:pdf newer_than:2y'
-        st.info("Teste amplo: qualquer remetente com PDF (2 anos).")
-
-    if do_search or do_fb or do_any:
+    if st.button("🔎 Buscar e-mails"):
         try:
-            msgs = gmail_list_messages(svc, query=query, max_results=int(maxr))
-            st.write(f"**{len(msgs)}** e-mail(s) encontrados para a consulta acima.")
+            msgs = gmail_list_messages(service, query=query, max_results=int(maxr))
+            st.write(f"Resultado da busca: **{len(msgs) if msgs else 0}** e-mail(s).")
             if not msgs:
-                st.info("Nada retornado para esse filtro. Tente o fallback ou o teste amplo.")
-                return
-
-            for m in msgs:
-                mid = m.get("id")
-                pdfs = gmail_fetch_pdf_attachments(svc, mid)
-                if not pdfs:
-                    continue
-                for idx, (fname, pdfb) in enumerate(pdfs):
-                    fh = sha1(pdfb)
-                    exists = db_already_ingested(fh)
-                    cols = st.columns([3,1,1])
-                    with cols[0]:
-                        st.write(f"📎 **{fname}** — hash `{fh[:10]}...`")
-                    with cols[1]:
-                        st.write("Status:", "🟡 já no banco" if exists else "🟢 novo")
-                    with cols[2]:
-                        if st.button("➕ Ingerir", key=f"ing_{fh}_{idx}", disabled=exists):
-                            res = process_one_pdf(pdfb, default_map, _pwd_sig=_PWD_SIG)
-                            if not res.get("ok"):
-                                st.error(res.get("error", "Falha no processamento"))
-                            else:
-                                db_save_ingestion(res, fh, fname)
-                                st.success("Nota ingerida no banco.")
+                st.info("Nenhum e-mail encontrado com esse filtro.")
+            else:
+                for m in msgs:
+                    mid = m.get("id")
+                    pdfs = gmail_fetch_pdf_attachments(service, mid)
+                    if not pdfs:
+                        with st.expander(f"E-mail {mid} — sem PDFs reconhecíveis"):
+                            st.write("Nenhum anexo PDF foi identificado (pode estar só no corpo e não ser PDF).")
+                        continue
+                    for fname, pdfb in pdfs:
+                        fh = sha1(pdfb)
+                        exists = db_already_ingested(fh)
+                        cols = st.columns([3,1,1])
+                        with cols[0]:
+                            st.write(f"📎 **{fname}** — hash `{fh[:10]}...`")
+                        with cols[1]:
+                            st.write("Status:", "🟡 já no banco" if exists else "🟢 novo")
+                        with cols[2]:
+                            if st.button("➕ Ingerir", key=f"ing_{fh}", disabled=exists):
+                                res = process_one_pdf(pdfb, default_map, _pwd_sig=_PWD_SIG)
+                                if not res.get("ok"):
+                                    st.error(res.get("error", "Falha no processamento"))
+                                else:
+                                    db_save_ingestion(res, fh, fname)
+                                    st.success("Nota ingerida no banco.")
         except Exception as e:
+            import traceback
             st.error(f"Erro ao buscar/baixar e-mails: {e}")
+            st.code(traceback.format_exc()[-1500:])
 
     with st.expander("Desconectar Gmail"):
         if st.button("Remover tokens salvos"):
@@ -1077,11 +1121,12 @@ def process_one_pdf(pdf_bytes: bytes, map_dict: dict, _pwd_sig: str = ""):
     if df_trades.empty:
         return {"ok": False, "error": "Não encontrei linhas de negociação.", "extractor": extractor, "layout": layout}
 
+    # normaliza ticker (fallback heurístico)
     rows = []
     for _, r in df_trades.iterrows():
         tkr = (r.get("Ativo") or "").strip().upper()
         if not tkr:
-            guess = derive_from_on_pn(r.get("Nome",""))
+            guess = (_guess_ticker_from_spec_name(r.get("Nome", "")) or derive_from_on_pn(r.get("Nome","")))
             if guess: tkr = guess
         rows.append({**r, "Ativo": tkr})
     df_trades = pd.DataFrame(rows)
@@ -1138,9 +1183,14 @@ def style_result_df(df: pd.DataFrame) -> Any:
         except Exception:
             sty = sty.applymap(op_style, subset=["Operação"])
     sty = sty.set_properties(**{"text-align":"center"})
-    sty = sty.set_table_styles([{"selector":"th", "props":[("text-align","center")]}], overwrite=False)
+    sty = sty.set_table_styles([
+        {"selector":"th", "props":[("text-align","center")]}
+    ], overwrite=False)
     if cols_emphasis:
-        sty = sty.set_properties(subset=cols_emphasis, **{"border-left":"1px solid #e5e7eb","border-right":"1px solid #e5e7eb"})
+        sty = sty.set_properties(
+            subset=cols_emphasis,
+            **{"border-left":"1px solid #e5e7eb","border-right":"1px solid #e5e7eb"}
+        )
     sty = sty.set_properties(**{"border":"1px solid #e5e7eb"})
     return sty
 
@@ -1161,8 +1211,12 @@ def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
 
     for i, r in df.iterrows():
         cols = st.columns(widths, vertical_alignment="center")
-        tkr = str(r["Ativo"]); qtd = r.get("Quantidade"); pm = r.get("PM")
-        cot = r.get("Cotação"); tot = r.get("Total"); pat = r.get("Patrimônio")
+        tkr = str(r["Ativo"])
+        qtd = r.get("Quantidade")
+        pm  = r.get("PM")
+        cot = r.get("Cotação")
+        tot = r.get("Total")
+        pat = r.get("Patrimônio")
 
         def _num(x, money=False):
             if pd.isna(x): return ""
@@ -1202,6 +1256,17 @@ def render_portfolio_interactive(df: pd.DataFrame, as_of_str: str):
                     render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
                 if st.button("Fechar"):
                     st.session_state.pop("open_modal_tkr", None)
+        else:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown(f"#### Movimentações — {tkr}")
+            df_mov = db_movements_for_ticker(tkr, as_of=as_of_str)
+            if df_mov.empty:
+                st.info("Sem movimentações para este ticker no período.")
+            else:
+                render_table(df_mov[["Data do Pregão","Operação","Quantidade","Valor","Preço Médio","Custos","Total"]])
+            if st.button("Fechar"):
+                st.session_state.pop("open_modal_tkr", None)
+            st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------------------- Diagnóstico (opcional) ----------------------
 def debug_probe_pdf_passwords(pdf_bytes: bytes) -> pd.DataFrame:
@@ -1303,11 +1368,10 @@ st.markdown("""
 st.markdown('<div class="big-title">Calc B3 – Nota de Corretagem</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Consolidado de notas B3/XP, carteira e movimentações com PM, patrimônio e cotações em tempo quase real.</div>', unsafe_allow_html=True)
 
-# default_map antes do Gmail
-default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3"}
-
 with st.sidebar:
     st.header("Opções")
+    st.success(f"BUILD: {APP_BUILD}")
+    st.caption(f"PDF pwds: {len(_PWD_LIST)}  •  Gmail cfg: {bool(_gmail_client_config_from_secrets())}")
     if st.button("🔄 Limpar cache e recarregar", use_container_width=True):
         st.cache_data.clear(); st.rerun()
     st.markdown("---")
@@ -1334,9 +1398,15 @@ with st.sidebar:
     map_file = st.file_uploader("Upload CSV de mapeamento (opcional)", type=["csv"], key="map_csv")
 
     st.markdown("---")
-    gmail_import_notes()
+    try:
+        gmail_import_notes()
+    except Exception as e:
+        import traceback
+        st.error("Gmail UI quebrou:")
+        st.code(f"{type(e).__name__}: {e}\n\n" + traceback.format_exc()[-1500:])
 
-if map_file is not None:
+default_map = {"EVEN":"EVEN3","PETRORECSA":"RECV3","VULCABRAS":"VULC3","AMBEV":"ABEV3","ALLOS":"ALLOS3","MARCOPOLO":"POMO3","MELNICK":"MELK3","AZZAS":"AZZA3","AZZA":"AZZA3"}
+if 'map_file' in locals() and map_file is not None:
     try:
         mdf = pd.read_csv(map_file)
         for _, row in mdf.iterrows():
@@ -1416,7 +1486,7 @@ else:
         if st.button("➕ Adicionar todas as notas visíveis"):
             inserted = 0; duplicated = 0
             for r in results:
-                if not r.get("ok"): 
+                if not r.get("ok"):
                     continue
                 fh = r["filehash"]
                 if db_already_ingested(fh) and not allow_dups:
@@ -1460,42 +1530,3 @@ total_row = {
     "PM": None,
     "Custo Atual": df_master["Custo Atual"].sum(skipna=True),
     "Total": None,
-    "Cotação": None,
-    "Patrimônio": df_master["Patrimônio"].sum(skipna=True),
-}
-df_master_tot = pd.concat([df_master, pd.DataFrame([total_row])], ignore_index=True)
-
-st.markdown('<div class="card">', unsafe_allow_html=True)
-st.markdown("#### Ativos")
-render_portfolio_interactive(df_master_tot[["Ativo","Quantidade","PM","Cotação","Total","Patrimônio"]], as_of_str=data_ate_str)
-st.caption("• Total = compras − vendas (líquido).  • Patrimônio = Quantidade × Cotação (0 quando posição zerada).")
-st.markdown('</div>', unsafe_allow_html=True)
-
-# ================================ Gerenciar banco ============================
-st.markdown("### ⚙️ Gerenciar carteira")
-with st.expander("🗑️ Excluir/estornar uma ingestão (com undo)"):
-    conn = db_connect()
-    df_ing = pd.read_sql_query("SELECT filehash, filename, layout, data_pregao, created_at FROM ingestions ORDER BY created_at DESC", conn)
-    conn.close()
-    if df_ing.empty:
-        st.info("Não há ingestões salvas.")
-    else:
-        st.dataframe(df_ing, width="stretch", hide_index=True)
-        fh_sel = st.selectbox("Selecione o filehash para excluir", df_ing["filehash"].tolist())
-        if st.button("Excluir ingestão selecionada"):
-            snap = db_delete_ingestion_with_snapshot(fh_sel)
-            if snap:
-                st.session_state["last_deleted_snap"] = snap
-                st.success("Ingestão excluída. Você pode desfazer abaixo.")
-            else:
-                st.warning("Ingestão não encontrada.")
-        if st.button("↩️ Desfazer última exclusão"):
-            snap = st.session_state.get("last_deleted_snap")
-            if snap:
-                ok = db_restore_ingestion_from_snapshot(snap)
-                if ok:
-                    st.success("Exclusão desfeita (ingestão restaurada).")
-                else:
-                    st.error("Falha ao restaurar.")
-            else:
-                st.info("Nada para desfazer.")
